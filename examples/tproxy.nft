@@ -1,0 +1,19 @@
+# Host-local TCP interception. Load policy routes before installing this table.
+# This template owns only the 'sometimes' table; it never flushes other rules.
+table inet sometimes {
+    chain output {
+        type route hook output priority mangle; policy accept;
+        meta mark 0x534f return
+        meta l4proto != tcp return
+        tcp dport 53 return
+        fib daddr type local return
+        ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return
+        ip6 daddr { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8 } return
+        meta mark set 0x5354
+    }
+
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        meta mark 0x5354 meta l4proto tcp tproxy to :12345 accept
+    }
+}

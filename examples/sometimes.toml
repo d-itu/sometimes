@@ -1,0 +1,80 @@
+max_connections = 256
+connect_timeout_secs = 15
+idle_timeout_secs = 300
+# Required for TPROXY; must match the bypass mark in tproxy.nft (0x534f).
+outbound_mark = 21327
+
+[[listeners]]
+host = "0.0.0.0"
+port = 12345
+protocol = "tproxy"
+
+[log]
+# Environment variable RUST_LOG overrides this value.
+level = "info"
+
+[upstream]
+# The hostname is also used for SNI and certificate verification.
+host = "proxy.example.com"
+# Optional; defaults to 443.
+# port = 443
+# Optional override when connecting to an IP or using a different TLS name:
+# server_name = "proxy.example.com"
+username = "replace-me"
+password = "replace-me"
+require_padding = true
+
+[sniff]
+enabled = true
+timeout_ms = 500
+max_bytes = 16384
+
+[routing]
+default = "proxy"
+
+# Rules are evaluated in order. Different conditions are ANDed;
+# multiple values within a condition are ORed.
+# [[routing.rules]]
+# domain_suffix = ["example.com"]
+# ports = [443]
+# action = "direct"
+
+# [[routing.rules]]
+# domain = ["blocked.example"]
+# action = "reject"
+
+[dns]
+# Enable after reviewing examples/dns-redirect.nft and matching its port to listen.
+enabled = false
+listen = ["127.0.0.1:1053", "[::1]:1053"]
+bootstrap = ["9.9.9.9:53"]
+timeout_ms = 2000
+max_packet_bytes = 4096
+cache_size = 4096
+# TCP DNS client connections are bounded separately from proxy connections.
+max_tcp_connections = 64
+# Close TCP DNS clients that stall while reading or writing.
+tcp_idle_timeout_secs = 30
+
+[[dns.upstreams]]
+name = "direct"
+protocol = "tcp+udp"
+host = "1.1.1.1"
+port = 53
+
+[[dns.upstreams]]
+name = "backup"
+protocol = "tcp+udp"
+host = "8.8.8.8"
+port = 53
+
+[dns.routing]
+default = "direct"
+
+# [[dns.routing.rules]]
+# domain_suffix = ["example.com"]
+# upstream = "backup"
+
+# [[dns.routing.rules]]
+# domain_suffix = ["blocked.example"]
+# action = "reject"
