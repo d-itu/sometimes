@@ -14,11 +14,11 @@ Padding is required by default. Set `require_padding = false` only to deliberate
 
 The optional **top-level** `outbound_mark = 21327` applies to all outbound TCP sockets (NaiveProxy and direct) and direct DNS UDP sockets. When omitted, these sockets do not set `SO_MARK`, so a standalone HTTP/SOCKS proxy needs no capability to mark sockets. A TPROXY listener requires a nonzero `outbound_mark`. The configured value must match the bypass mark in the nftables rules; setting it requires `CAP_NET_ADMIN` (or the appropriate socket-mark capability on supported kernels).
 
-Do not omit the mark while host-level interception rules can capture the client's outbound traffic, even if all configured listeners are HTTP or SOCKS. Set it when loading `examples/dns-redirect.nft` so direct DNS upstream and bootstrap queries bypass the redirect. The program cannot detect external firewall rules. Move an existing `upstream.socket_mark` to the top level; the old field is rejected.
+Do not omit the mark while host-level interception rules can capture the client's outbound traffic, even if all configured listeners are HTTP or SOCKS. Set it when loading `examples/dns-redirect.nft` so direct DNS upstream and bootstrap queries bypass the redirect. The program cannot detect external firewall rules.
 
 ## Explicit proxy listeners
 
-Listeners use separate `host`, `port`, and `protocol` fields. `host` is a local IP address; the old `listen` and `address` formats are unsupported.
+Listeners use separate `host`, `port`, and `protocol` fields. `host` is a local IP address;
 
 ```toml
 [[listeners]]

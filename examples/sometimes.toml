@@ -2,7 +2,7 @@ max_connections = 256
 connect_timeout_secs = 15
 idle_timeout_secs = 300
 # Required for TPROXY; must match the bypass mark in tproxy.nft (0x534f).
-outbound_mark = 21327
+outbound_mark = 0x534f
 
 [[listeners]]
 host = "0.0.0.0"
