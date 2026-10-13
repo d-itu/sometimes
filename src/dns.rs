@@ -26,7 +26,8 @@ use crate::{
 mod bootstrap;
 mod cache;
 mod packet;
-use bootstrap::{BootstrapCache, bootstrap_cache, resolve_host};
+pub(crate) use bootstrap::resolve_host;
+use bootstrap::{BootstrapCache, bootstrap_cache};
 use cache::ResponseCache;
 use packet::{query, refused, validate_response, with_id};
 

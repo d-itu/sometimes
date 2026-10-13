@@ -28,7 +28,7 @@ pub(super) fn bootstrap_cache() -> BootstrapCache {
     )))
 }
 
-pub(super) async fn resolve_host(
+pub(crate) async fn resolve_host(
     host: &str,
     port: u16,
     config: &Config,

@@ -21,7 +21,7 @@ use rama::{
 };
 use tokio::task::JoinHandle;
 
-use crate::{config::Upstream, outbound::connect_outbound};
+use crate::{config::Upstream, dns, outbound::connect_outbound};
 
 pub struct Client {
     upstream: Upstream,
@@ -29,6 +29,7 @@ pub struct Client {
     tls: TlsConnector,
     authorization: HeaderValue,
     server_name: ServerName<'static>,
+    dns: dns::Config,
 }
 
 /// Owns the H2 driver so cancellation cannot leak background connections.
@@ -55,6 +56,14 @@ impl Drop for Driver {
 
 impl Client {
     pub fn new(upstream: Upstream, outbound_mark: Option<u32>) -> Result<Self> {
+        Self::new_with_dns(upstream, outbound_mark, dns::Config::default())
+    }
+
+    pub fn new_with_dns(
+        upstream: Upstream,
+        outbound_mark: Option<u32>,
+        dns: dns::Config,
+    ) -> Result<Self> {
         upstream.validate()?;
         let server_name = ServerName::try_from(
             upstream
@@ -77,13 +86,19 @@ impl Client {
             tls: TlsConnector::from(Arc::new(tls)),
             authorization,
             server_name,
+            dns,
         })
     }
 
     pub async fn connect(&self, destination: impl Into<Authority>) -> Result<Tunnel> {
-        let addresses = tokio::net::lookup_host((self.upstream.host.as_str(), self.upstream.port))
-            .await
-            .context("resolve upstream hostname")?;
+        let addresses = dns::resolve_host(
+            &self.upstream.host,
+            self.upstream.port,
+            &self.dns,
+            self.outbound_mark,
+        )
+        .await
+        .context("resolve upstream hostname")?;
         self.connect_addresses(addresses, destination.into()).await
     }
 

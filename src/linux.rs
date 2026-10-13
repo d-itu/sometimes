@@ -80,7 +80,11 @@ pub async fn run(mut config: Config) -> Result<()> {
     config.validate()?;
     config.routing.prepare()?;
     let config = Arc::new(config);
-    let client = Arc::new(Client::new(config.upstream.clone(), config.outbound_mark)?);
+    let client = Arc::new(Client::new_with_dns(
+        config.upstream.clone(),
+        config.outbound_mark,
+        config.dns.clone(),
+    )?);
     let permits = Arc::new(Semaphore::new(config.max_connections));
     let outbound_permits = Arc::new(Semaphore::new(config.max_connections));
     let mut acceptors = JoinSet::new();
