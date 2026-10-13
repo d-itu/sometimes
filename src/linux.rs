@@ -80,10 +80,11 @@ pub async fn run(mut config: Config) -> Result<()> {
     config.validate()?;
     config.routing.prepare()?;
     let config = Arc::new(config);
-    let client = Arc::new(Client::new_with_dns(
+    let resolver = dns::bootstrap::Resolver::from_config(&config.dns, config.outbound_mark);
+    let client = Arc::new(Client::new_with_resolver(
         config.upstream.clone(),
         config.outbound_mark,
-        config.dns.clone(),
+        resolver.clone(),
     )?);
     let permits = Arc::new(Semaphore::new(config.max_connections));
     let outbound_permits = Arc::new(Semaphore::new(config.max_connections));
@@ -93,10 +94,9 @@ pub async fn run(mut config: Config) -> Result<()> {
     let dns_mark = config.outbound_mark;
     let dns_routing = config.routing.clone();
     let dns_client = client.clone();
-    let mut dns_task =
-        tokio::spawn(
-            async move { dns::run(Arc::new(dns), dns_mark, dns_routing, dns_client).await },
-        );
+    let mut dns_task = tokio::spawn(async move {
+        dns::run(Arc::new(dns), dns_mark, dns_routing, dns_client, resolver).await
+    });
     // Bind all listeners before starting any accept task.
     let listeners = config
         .listeners

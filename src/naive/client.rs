@@ -21,7 +21,11 @@ use rama::{
 };
 use tokio::task::JoinHandle;
 
-use crate::{config::Upstream, dns, outbound::connect_outbound};
+use crate::{
+    config::Upstream,
+    dns::{self, bootstrap::Resolver},
+    outbound::connect_outbound,
+};
 
 pub struct Client {
     upstream: Upstream,
@@ -29,7 +33,7 @@ pub struct Client {
     tls: TlsConnector,
     authorization: HeaderValue,
     server_name: ServerName<'static>,
-    dns: dns::Config,
+    resolver: Arc<Resolver>,
 }
 
 /// Owns the H2 driver so cancellation cannot leak background connections.
@@ -56,13 +60,17 @@ impl Drop for Driver {
 
 impl Client {
     pub fn new(upstream: Upstream, outbound_mark: Option<u32>) -> Result<Self> {
-        Self::new_with_dns(upstream, outbound_mark, dns::Config::default())
+        Self::new_with_resolver(
+            upstream,
+            outbound_mark,
+            Resolver::from_config(&dns::Config::default(), outbound_mark),
+        )
     }
 
-    pub fn new_with_dns(
+    pub(crate) fn new_with_resolver(
         upstream: Upstream,
         outbound_mark: Option<u32>,
-        dns: dns::Config,
+        resolver: Arc<Resolver>,
     ) -> Result<Self> {
         upstream.validate()?;
         let server_name = ServerName::try_from(
@@ -86,19 +94,16 @@ impl Client {
             tls: TlsConnector::from(Arc::new(tls)),
             authorization,
             server_name,
-            dns,
+            resolver,
         })
     }
 
     pub async fn connect(&self, destination: impl Into<Authority>) -> Result<Tunnel> {
-        let addresses = dns::resolve_host(
-            &self.upstream.host,
-            self.upstream.port,
-            &self.dns,
-            self.outbound_mark,
-        )
-        .await
-        .context("resolve upstream hostname")?;
+        let addresses = self
+            .resolver
+            .resolve_host(&self.upstream.host, self.upstream.port)
+            .await
+            .context("resolve upstream hostname")?;
         self.connect_addresses(addresses, destination.into()).await
     }
 

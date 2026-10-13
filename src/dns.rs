@@ -23,11 +23,11 @@ use crate::{
     routing::{Action as RouteAction, Routing, normalize_domain},
 };
 
-mod bootstrap;
+pub mod bootstrap;
 mod cache;
 mod packet;
-pub(crate) use bootstrap::resolve_host;
-use bootstrap::{BootstrapCache, bootstrap_cache};
+
+use bootstrap::Resolver;
 use cache::ResponseCache;
 use packet::{query, refused, validate_response, with_id};
 
@@ -44,8 +44,6 @@ pub struct Config {
     pub max_tcp_connections: usize,
     pub tcp_idle_timeout_secs: u64,
     pub routing: DnsRouting,
-    #[serde(skip, default = "bootstrap_cache")]
-    bootstrap_cache: BootstrapCache,
 }
 
 impl Default for Config {
@@ -61,7 +59,6 @@ impl Default for Config {
             max_tcp_connections: 64,
             tcp_idle_timeout_secs: 30,
             routing: DnsRouting::default(),
-            bootstrap_cache: bootstrap_cache(),
         }
     }
 }
@@ -241,11 +238,12 @@ impl Config {
 
 type Cache = Arc<ResponseCache>;
 
-pub async fn run(
+pub(crate) async fn run(
     config: Arc<Config>,
     mark: Option<u32>,
     routing: Routing,
     client: Arc<Client>,
+    resolver: Arc<Resolver>,
 ) -> Result<()> {
     if !config.enabled {
         return Ok(());
@@ -271,6 +269,7 @@ pub async fn run(
             cache_udp,
             routing_udp,
             client_udp,
+            resolver.clone(),
             mark,
         ));
         let config_tcp = config.clone();
@@ -283,6 +282,7 @@ pub async fn run(
             cache_tcp,
             routing_tcp,
             client_tcp,
+            resolver.clone(),
             mark,
         ));
     }
@@ -298,6 +298,7 @@ async fn serve_udp(
     cache: Cache,
     routing: Routing,
     client: Arc<Client>,
+    resolver: Arc<Resolver>,
     mark: Option<u32>,
 ) -> Result<()> {
     let socket = Arc::new(socket);
@@ -316,8 +317,13 @@ async fn serve_udp(
         let cache = cache.clone();
         let routing = routing.clone();
         let client = client.clone();
+        let resolver = resolver.clone();
         requests.spawn(async move {
-            match handle(&request, &config, &cache, &routing, &client, mark).await {
+            match handle(
+                &request, &config, &cache, &routing, &client, &resolver, mark,
+            )
+            .await
+            {
                 Ok(response) => {
                     if let Err(error) = socket.send_to(&response, peer).await {
                         tracing::warn!(%error, "DNS UDP reply failed");
@@ -340,6 +346,7 @@ async fn serve_tcp(
     cache: Cache,
     routing: Routing,
     client: Arc<Client>,
+    resolver: Arc<Resolver>,
     mark: Option<u32>,
 ) -> Result<()> {
     let mut connections = JoinSet::new();
@@ -354,8 +361,9 @@ async fn serve_tcp(
         let cache = cache.clone();
         let routing = routing.clone();
         let client = client.clone();
+        let resolver = resolver.clone();
         connections.spawn(async move {
-            let _ = handle_tcp(stream, c, cache, routing, client, mark).await;
+            let _ = handle_tcp(stream, c, cache, routing, client, resolver, mark).await;
         });
         while let Some(result) = connections.try_join_next() {
             if let Err(error) = result {
@@ -371,6 +379,7 @@ async fn handle_tcp(
     cache: Cache,
     routing: Routing,
     client: Arc<Client>,
+    resolver: Arc<Resolver>,
     mark: Option<u32>,
 ) -> Result<()> {
     let idle = Duration::from_secs(config.tcp_idle_timeout_secs);
@@ -382,7 +391,10 @@ async fn handle_tcp(
         );
         let mut request = vec![0; size];
         timeout(idle, stream.read_exact(&mut request)).await??;
-        let response = handle(&request, &config, &cache, &routing, &client, mark).await?;
+        let response = handle(
+            &request, &config, &cache, &routing, &client, &resolver, mark,
+        )
+        .await?;
         ensure!(
             response.len() <= u16::MAX as usize,
             "DNS response is too large"
@@ -401,6 +413,7 @@ async fn handle(
     cache: &Cache,
     routing: &Routing,
     client: &Client,
+    resolver: &Resolver,
     mark: Option<u32>,
 ) -> Result<Vec<u8>> {
     let (name, _, _) = query(request).ok_or_else(|| anyhow::anyhow!("invalid DNS query"))?;
@@ -410,13 +423,14 @@ async fn handle(
     let Some(upstream) = config.target(&name)? else {
         return refused(request);
     };
-    let response = match query_upstream(request, upstream, config, routing, client, mark).await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!(upstream = %upstream.name, %error, "DNS upstream query failed");
-            refused(request)?
-        }
-    };
+    let response =
+        match query_upstream(request, upstream, config, routing, client, resolver, mark).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(upstream = %upstream.name, %error, "DNS upstream query failed");
+                refused(request)?
+            }
+        };
     cache.insert(request, &response);
     with_id(&response, request)
 }
@@ -427,6 +441,7 @@ async fn query_upstream(
     config: &Config,
     routing: &Routing,
     client: &Client,
+    resolver: &Resolver,
     mark: Option<u32>,
 ) -> Result<Vec<u8>> {
     let domain = normalize_domain(&upstream.host);
@@ -446,7 +461,7 @@ async fn query_upstream(
         tracing::info!(upstream = %upstream.name, %target, "DNS upstream routed through proxy");
         return query_tcp_proxy(request, target, config, client).await;
     }
-    let addresses = resolve_host(&upstream.host, upstream.port, config, mark).await?;
+    let addresses = resolver.resolve_host(&upstream.host, upstream.port).await?;
     let mut last_error = None;
     for address in addresses {
         let (action, rule) = routing.select(address, normalize_domain(&upstream.host).as_deref());
@@ -463,9 +478,26 @@ async fn query_upstream(
         let result = match action {
             RouteAction::Reject => Err(anyhow::anyhow!("DNS upstream rejected by routing")),
             RouteAction::Direct => match upstream.protocol {
-                Protocol::Udp => query_udp(request, address, config, mark).await,
+                Protocol::Udp => {
+                    query_udp(
+                        request,
+                        address,
+                        Duration::from_millis(config.timeout_ms),
+                        config.max_packet_bytes,
+                        mark,
+                    )
+                    .await
+                }
                 Protocol::Tcp => query_tcp(request, address, config, mark).await,
-                Protocol::TcpUdp => match query_udp(request, address, config, mark).await {
+                Protocol::TcpUdp => match query_udp(
+                    request,
+                    address,
+                    Duration::from_millis(config.timeout_ms),
+                    config.max_packet_bytes,
+                    mark,
+                )
+                .await
+                {
                     Ok(response) if !response.get(2).is_some_and(|v| v & 2 != 0) => Ok(response),
                     _ => query_tcp(request, address, config, mark).await,
                 },
@@ -492,7 +524,8 @@ async fn query_upstream(
 async fn query_udp(
     request: &[u8],
     address: SocketAddr,
-    config: &Config,
+    deadline: Duration,
+    max_packet_bytes: usize,
     mark: Option<u32>,
 ) -> Result<Vec<u8>> {
     let socket = UdpSocket::bind(if address.is_ipv4() {
@@ -507,14 +540,10 @@ async fn query_udp(
     }
     socket.connect(address).await?;
     socket.send(request).await?;
-    let mut response = vec![0; config.max_packet_bytes + 1];
-    let size = timeout(
-        Duration::from_millis(config.timeout_ms),
-        socket.recv(&mut response),
-    )
-    .await??;
+    let mut response = vec![0; max_packet_bytes + 1];
+    let size = timeout(deadline, socket.recv(&mut response)).await??;
     ensure!(
-        size <= config.max_packet_bytes,
+        size <= max_packet_bytes,
         "DNS UDP response exceeds max_packet_bytes"
     );
     response.truncate(size);
@@ -609,9 +638,15 @@ mod tests {
             ..Config::default()
         };
         let request = packet::make_query("example.com", 1);
-        let error = query_udp(&request, address, &config, None)
-            .await
-            .unwrap_err();
+        let error = query_udp(
+            &request,
+            address,
+            Duration::from_millis(config.timeout_ms),
+            config.max_packet_bytes,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("exceeds max_packet_bytes"));
         task.await.unwrap();
     }
@@ -641,9 +676,12 @@ mod tests {
         .unwrap();
         let routing = Routing::default();
         let request = packet::make_query("example.com", 1);
-        let error = query_upstream(&request, &upstream, &config, &routing, &client, None)
-            .await
-            .unwrap_err();
+        let resolver = Resolver::from_config(&config, None);
+        let error = query_upstream(
+            &request, &upstream, &config, &routing, &client, &resolver, None,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("UDP DNS cannot use NaiveProxy"));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -666,9 +704,11 @@ mod tests {
             ..upstream
         };
         assert!(
-            query_upstream(&request, &upstream, &config, &routing, &client, None)
-                .await
-                .is_err()
+            query_upstream(
+                &request, &upstream, &config, &routing, &client, &resolver, None
+            )
+            .await
+            .is_err()
         );
         timeout(Duration::from_secs(3), accepted)
             .await
