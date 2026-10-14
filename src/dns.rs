@@ -29,7 +29,7 @@ mod packet;
 
 use bootstrap::Resolver;
 use cache::ResponseCache;
-use packet::{query, refused, validate_response, with_id};
+use packet::{error_response, query, validate_response, with_id};
 
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -384,13 +384,13 @@ impl Context {
             return response;
         }
         let Some(upstream) = self.config.target(&name)? else {
-            return refused(request);
+            return error_response(request, 5);
         };
         let response = match self.query_upstream(request, upstream).await {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(upstream = %upstream.name, %error, "DNS upstream query failed");
-                refused(request)?
+                error_response(request, 2)?
             }
         };
         self.cache.insert(request, &response);

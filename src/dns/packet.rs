@@ -225,7 +225,7 @@ pub(super) fn with_id(packet: &[u8], request: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-pub(super) fn refused(request: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn error_response(request: &[u8], rcode: u8) -> Result<Vec<u8>> {
     ensure!(request.len() >= 12, "invalid DNS header");
     let question_end = skip_name(request, 12)
         .and_then(|pos| pos.checked_add(4))
@@ -233,7 +233,7 @@ pub(super) fn refused(request: &[u8]) -> Result<Vec<u8>> {
         .ok_or_else(|| anyhow::anyhow!("invalid DNS question"))?;
     let mut response = request[..question_end].to_vec();
     response[2] |= 0x80;
-    response[3] = (response[3] & 0x01) | 0x02;
+    response[3] = (response[3] & 0x01) | rcode;
     response[4..6].copy_from_slice(&1u16.to_be_bytes());
     response[6..12].fill(0);
     Ok(response)
