@@ -174,40 +174,14 @@ impl State {
                         _permit: permit,
                     });
                 }
-                let destination = match host.parse() {
-                    Ok(ip) => SocketAddr::new(ip, port),
-                    Err(_) => tokio::net::lookup_host((host, port))
-                        .await?
-                        .next()
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::NotFound,
-                                "target DNS returned no address",
-                            )
-                        })?,
-                };
-                let (action, rule) = self.config.routing.select(destination, domain.as_deref());
-                tracing::info!(%destination, domain = host, ?action, ?rule, "route selected");
-                let (transport, driver) = match action {
-                    Action::Reject => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "route rejected",
-                        ));
+                let (transport, driver) = match host.parse() {
+                    Ok(ip) => {
+                        self.connect_resolved([SocketAddr::new(ip, port)], domain.as_deref())
+                            .await?
                     }
-                    Action::Direct => (
-                        Transport::Direct(
-                            connect_outbound(destination, self.config.outbound_mark).await?,
-                        ),
-                        None,
-                    ),
-                    Action::Proxy => {
-                        let tunnel = self
-                            .client
-                            .connect(destination)
-                            .await
-                            .map_err(io::Error::other)?;
-                        tunnel_transport(tunnel, Duration::from_secs(self.config.idle_timeout_secs))
+                    Err(_) => {
+                        let addresses = tokio::net::lookup_host((host, port)).await?;
+                        self.connect_resolved(addresses, domain.as_deref()).await?
                     }
                 };
                 Ok(Egress {
@@ -225,6 +199,46 @@ impl State {
                 "target connection deadline exceeded",
             )
         })?
+    }
+
+    async fn connect_resolved(
+        &self,
+        addresses: impl IntoIterator<Item = SocketAddr>,
+        domain: Option<&str>,
+    ) -> io::Result<(Transport, Option<JoinHandle<()>>)> {
+        let mut last_error = None;
+        for destination in addresses {
+            let (action, rule) = self.config.routing.select(destination, domain);
+            tracing::info!(%destination, ?domain, ?action, ?rule, "route selected");
+            match action {
+                Action::Reject => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "route rejected",
+                    ));
+                }
+                Action::Direct => {
+                    match connect_outbound(destination, self.config.outbound_mark).await {
+                        Ok(stream) => return Ok((Transport::Direct(stream), None)),
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Action::Proxy => {
+                    let tunnel = self
+                        .client
+                        .connect(destination)
+                        .await
+                        .map_err(io::Error::other)?;
+                    return Ok(tunnel_transport(
+                        tunnel,
+                        Duration::from_secs(self.config.idle_timeout_secs),
+                    ));
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "target DNS returned no address")
+        }))
     }
 }
 

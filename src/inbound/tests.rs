@@ -13,6 +13,70 @@ use tokio::{
 };
 
 #[tokio::test]
+async fn resolved_addresses_retry_direct_and_recheck_routing() {
+    timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = listener.local_addr().unwrap();
+        let unavailable = SocketAddr::new("127.0.0.2".parse().unwrap(), destination.port());
+        let config = config(Action::Direct);
+        let client = Arc::new(Client::new(config.upstream.clone(), None).unwrap());
+        let state = State {
+            config: Arc::new(config),
+            client: client.clone(),
+            permits: Arc::new(Semaphore::new(1)),
+        };
+        let (transport, _) = state
+            .connect_resolved([unavailable, destination], Some("example.test"))
+            .await
+            .unwrap();
+        assert!(matches!(transport, Transport::Direct(_)));
+        let (stream, _) = listener.accept().await.unwrap();
+        drop((transport, stream));
+
+        let mut config = self::config(Action::Direct);
+        config.routing = toml::from_str(&format!(
+            "default = 'direct'\n[[rules]]\nip_cidr = ['{}/32']\naction = 'reject'",
+            destination.ip()
+        ))
+        .unwrap();
+        let state = State {
+            config: Arc::new(config),
+            client,
+            permits: Arc::new(Semaphore::new(1)),
+        };
+        let error = state
+            .connect_resolved([unavailable, destination], Some("example.test"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        let proxy_address = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = self::config(Action::Direct);
+        config.upstream.port = proxy_address.local_addr().unwrap().port();
+        drop(proxy_address);
+        config.routing = toml::from_str(
+            "default = 'direct'\n[[rules]]\nip_cidr = ['127.0.0.2/32']\naction = 'proxy'",
+        )
+        .unwrap();
+        let client = Arc::new(Client::new(config.upstream.clone(), None).unwrap());
+        let state = State {
+            config: Arc::new(config),
+            client,
+            permits: Arc::new(Semaphore::new(1)),
+        };
+        assert!(
+            state
+                .connect_resolved([unavailable, destination], Some("example.test"))
+                .await
+                .is_err()
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn single_connection_limit_can_forward_http() {
     timeout(Duration::from_secs(5), async {
         let (origin_address, origin_task) = origin("single").await;
