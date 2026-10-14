@@ -87,17 +87,6 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
     let outbound_permits = Arc::new(Semaphore::new(config.max_connections));
     let mut acceptors = JoinSet::new();
     let mut flows = JoinSet::new();
-    let dns = config.dns.clone();
-    let dns_mark = config.outbound_mark;
-    let dns_routing = config.routing.clone();
-    let dns_client = client.clone();
-    let mut dns_task = tokio::spawn(dns::run(
-        Arc::new(dns),
-        dns_mark,
-        dns_routing,
-        dns_client,
-        resolver,
-    ));
     // Bind all listeners before starting any accept task.
     let listeners = config
         .listeners
@@ -108,6 +97,19 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
                 .with_context(|| format!("bind listener {address}"))
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    let mut dns_tasks = JoinSet::new();
+    if config.dns.enabled {
+        dns_tasks.spawn(dns::run(
+            Arc::new(config.dns.clone()),
+            config.outbound_mark,
+            config.routing.clone(),
+            client.clone(),
+            resolver,
+        ));
+    }
     let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(config.listeners.len());
     for (listener, configured) in listeners.into_iter().zip(config.listeners.iter().cloned()) {
         let tx = accepted_tx.clone();
@@ -125,15 +127,12 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         });
     }
     drop(accepted_tx);
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let interrupt = tokio::signal::ctrl_c();
-    tokio::pin!(interrupt);
     tracing::info!(listeners = config.listeners.len(), "TCP client started");
     loop {
         tokio::select! {
             result = &mut interrupt => { result?; break; }
             _ = terminate.recv() => break,
-            result = &mut dns_task, if config.dns.enabled => {
+            Some(result) = dns_tasks.join_next(), if config.dns.enabled => {
                 result.context("DNS task failed")??;
                 anyhow::bail!("DNS service stopped unexpectedly");
             }
@@ -173,7 +172,7 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         }
     }
     acceptors.abort_all();
-    dns_task.abort();
+    dns_tasks.abort_all();
     tracing::info!(
         active = flows.len(),
         "draining active connections for up to 10 seconds"
