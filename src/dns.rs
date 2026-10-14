@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context as AnyhowContext, Result, ensure};
 use rama::net::address::{Authority, Domain, HostWithPort};
 use serde::Deserialize;
 use tokio::{
@@ -238,6 +238,16 @@ impl Config {
 
 type Cache = Arc<ResponseCache>;
 
+#[derive(Clone)]
+struct Context {
+    config: Arc<Config>,
+    cache: Cache,
+    routing: Arc<Routing>,
+    client: Arc<Client>,
+    resolver: Arc<Resolver>,
+    mark: Option<u32>,
+}
+
 pub(crate) async fn run(
     config: Arc<Config>,
     mark: Option<u32>,
@@ -251,274 +261,256 @@ pub(crate) async fn run(
     let cache = Arc::new(ResponseCache::new(
         NonZeroUsize::new(config.cache_size).expect("validated nonzero DNS cache size"),
     ));
-    let mut tasks = JoinSet::new();
-    for address in &config.listen {
-        let udp = UdpSocket::bind(address)
-            .await
-            .context("bind DNS UDP listener")?;
-        let tcp = TcpListener::bind(address)
-            .await
-            .context("bind DNS TCP listener")?;
-        let config_udp = config.clone();
-        let cache_udp = cache.clone();
-        let routing_udp = routing.clone();
-        let client_udp = client.clone();
-        tasks.spawn(serve_udp(
-            udp,
-            config_udp,
-            cache_udp,
-            routing_udp,
-            client_udp,
-            resolver.clone(),
-            mark,
-        ));
-        let config_tcp = config.clone();
-        let cache_tcp = cache.clone();
-        let routing_tcp = routing.clone();
-        let client_tcp = client.clone();
-        tasks.spawn(serve_tcp(
-            tcp,
-            config_tcp,
-            cache_tcp,
-            routing_tcp,
-            client_tcp,
-            resolver.clone(),
-            mark,
-        ));
-    }
-    let result = tasks.join_next().await.context("no DNS listener started")?;
-    tasks.abort_all();
-    result.context("DNS task failed")??;
-    anyhow::bail!("DNS listener stopped unexpectedly")
+    let context = Context::new(config, cache, routing, client, resolver, mark);
+    context.run().await
 }
 
-async fn serve_udp(
-    socket: UdpSocket,
-    config: Arc<Config>,
-    cache: Cache,
-    routing: Routing,
-    client: Arc<Client>,
-    resolver: Arc<Resolver>,
-    mark: Option<u32>,
-) -> Result<()> {
-    let socket = Arc::new(socket);
-    let mut buffer = vec![0; config.max_packet_bytes];
-    let mut requests = JoinSet::new();
-    loop {
-        if requests.len() >= 64
-            && let Some(Err(error)) = requests.join_next().await
-        {
-            tracing::warn!(%error, "DNS UDP request task failed");
+impl Context {
+    fn new(
+        config: Arc<Config>,
+        cache: Cache,
+        routing: Routing,
+        client: Arc<Client>,
+        resolver: Arc<Resolver>,
+        mark: Option<u32>,
+    ) -> Self {
+        Self {
+            config,
+            cache,
+            routing: Arc::new(routing),
+            client,
+            resolver,
+            mark,
         }
-        let (size, peer) = socket.recv_from(&mut buffer).await?;
-        let request = buffer[..size].to_vec();
-        let socket = socket.clone();
-        let config = config.clone();
-        let cache = cache.clone();
-        let routing = routing.clone();
-        let client = client.clone();
-        let resolver = resolver.clone();
-        requests.spawn(async move {
-            match handle(
-                &request, &config, &cache, &routing, &client, &resolver, mark,
-            )
-            .await
+    }
+
+    async fn run(&self) -> Result<()> {
+        let mut tasks = JoinSet::new();
+        for address in &self.config.listen {
+            let udp = UdpSocket::bind(address)
+                .await
+                .context("bind DNS UDP listener")?;
+            let tcp = TcpListener::bind(address)
+                .await
+                .context("bind DNS TCP listener")?;
+            tasks.spawn(self.clone().serve_udp(udp));
+            tasks.spawn(self.clone().serve_tcp(tcp));
+        }
+        let result = tasks.join_next().await.context("no DNS listener started")?;
+        tasks.abort_all();
+        result.context("DNS task failed")??;
+        anyhow::bail!("DNS listener stopped unexpectedly")
+    }
+
+    async fn serve_udp(self, socket: UdpSocket) -> Result<()> {
+        let socket = Arc::new(socket);
+        let mut buffer = vec![0; self.config.max_packet_bytes];
+        let mut requests = JoinSet::new();
+        loop {
+            if requests.len() >= 64
+                && let Some(Err(error)) = requests.join_next().await
             {
-                Ok(response) => {
-                    if let Err(error) = socket.send_to(&response, peer).await {
-                        tracing::warn!(%error, "DNS UDP reply failed");
-                    }
-                }
-                Err(error) => tracing::debug!(%error, "DNS UDP query rejected"),
-            }
-        });
-        while let Some(result) = requests.try_join_next() {
-            if let Err(error) = result {
                 tracing::warn!(%error, "DNS UDP request task failed");
             }
-        }
-    }
-}
-
-async fn serve_tcp(
-    listener: TcpListener,
-    config: Arc<Config>,
-    cache: Cache,
-    routing: Routing,
-    client: Arc<Client>,
-    resolver: Arc<Resolver>,
-    mark: Option<u32>,
-) -> Result<()> {
-    let mut connections = JoinSet::new();
-    loop {
-        if connections.len() >= config.max_tcp_connections
-            && let Some(Err(error)) = connections.join_next().await
-        {
-            tracing::warn!(%error, "DNS TCP connection task failed");
-        }
-        let (stream, _) = listener.accept().await?;
-        let c = config.clone();
-        let cache = cache.clone();
-        let routing = routing.clone();
-        let client = client.clone();
-        let resolver = resolver.clone();
-        connections.spawn(async move {
-            let _ = handle_tcp(stream, c, cache, routing, client, resolver, mark).await;
-        });
-        while let Some(result) = connections.try_join_next() {
-            if let Err(error) = result {
-                tracing::warn!(%error, "DNS TCP connection task failed");
+            let (size, peer) = socket.recv_from(&mut buffer).await?;
+            let request = buffer[..size].to_vec();
+            let socket = socket.clone();
+            let context = self.clone();
+            requests.spawn(async move {
+                match context.handle(&request).await {
+                    Ok(response) => {
+                        if let Err(error) = socket.send_to(&response, peer).await {
+                            tracing::warn!(%error, "DNS UDP reply failed");
+                        }
+                    }
+                    Err(error) => tracing::debug!(%error, "DNS UDP query rejected"),
+                }
+            });
+            while let Some(result) = requests.try_join_next() {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "DNS UDP request task failed");
+                }
             }
         }
     }
-}
 
-async fn handle_tcp(
-    mut stream: TcpStream,
-    config: Arc<Config>,
-    cache: Cache,
-    routing: Routing,
-    client: Arc<Client>,
-    resolver: Arc<Resolver>,
-    mark: Option<u32>,
-) -> Result<()> {
-    let idle = Duration::from_secs(config.tcp_idle_timeout_secs);
-    loop {
-        let size = timeout(idle, stream.read_u16()).await?? as usize;
-        ensure!(
-            size <= config.max_packet_bytes,
-            "DNS TCP packet is too large"
-        );
-        let mut request = vec![0; size];
-        timeout(idle, stream.read_exact(&mut request)).await??;
-        let response = handle(
-            &request, &config, &cache, &routing, &client, &resolver, mark,
-        )
-        .await?;
-        ensure!(
-            response.len() <= u16::MAX as usize,
-            "DNS response is too large"
-        );
-        timeout(idle, async {
-            stream.write_u16(response.len() as u16).await?;
-            stream.write_all(&response).await
-        })
-        .await??;
+    async fn serve_tcp(self, listener: TcpListener) -> Result<()> {
+        let mut connections = JoinSet::new();
+        loop {
+            if connections.len() >= self.config.max_tcp_connections
+                && let Some(Err(error)) = connections.join_next().await
+            {
+                tracing::warn!(%error, "DNS TCP connection task failed");
+            }
+            let (stream, _) = listener.accept().await?;
+            let context = self.clone();
+            connections.spawn(async move {
+                let _ = context.handle_tcp(stream).await;
+            });
+            while let Some(result) = connections.try_join_next() {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "DNS TCP connection task failed");
+                }
+            }
+        }
     }
-}
 
-async fn handle(
-    request: &[u8],
-    config: &Config,
-    cache: &Cache,
-    routing: &Routing,
-    client: &Client,
-    resolver: &Resolver,
-    mark: Option<u32>,
-) -> Result<Vec<u8>> {
-    let (name, _, _) = query(request).ok_or_else(|| anyhow::anyhow!("invalid DNS query"))?;
-    if let Some(response) = cache.get(request) {
-        return response;
+    async fn handle_tcp(self, mut stream: TcpStream) -> Result<()> {
+        let idle = Duration::from_secs(self.config.tcp_idle_timeout_secs);
+        loop {
+            let size = timeout(idle, stream.read_u16()).await?? as usize;
+            ensure!(
+                size <= self.config.max_packet_bytes,
+                "DNS TCP packet is too large"
+            );
+            let mut request = vec![0; size];
+            timeout(idle, stream.read_exact(&mut request)).await??;
+            let response = self.handle(&request).await?;
+            ensure!(
+                response.len() <= u16::MAX as usize,
+                "DNS response is too large"
+            );
+            timeout(idle, async {
+                stream.write_u16(response.len() as u16).await?;
+                stream.write_all(&response).await
+            })
+            .await??;
+        }
     }
-    let Some(upstream) = config.target(&name)? else {
-        return refused(request);
-    };
-    let response =
-        match query_upstream(request, upstream, config, routing, client, resolver, mark).await {
+
+    async fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
+        let (name, _, _) = query(request).ok_or_else(|| anyhow::anyhow!("invalid DNS query"))?;
+        if let Some(response) = self.cache.get(request) {
+            return response;
+        }
+        let Some(upstream) = self.config.target(&name)? else {
+            return refused(request);
+        };
+        let response = match self.query_upstream(request, upstream).await {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(upstream = %upstream.name, %error, "DNS upstream query failed");
                 refused(request)?
             }
         };
-    cache.insert(request, &response);
-    with_id(&response, request)
-}
-
-async fn query_upstream(
-    request: &[u8],
-    upstream: &Upstream,
-    config: &Config,
-    routing: &Routing,
-    client: &Client,
-    resolver: &Resolver,
-    mark: Option<u32>,
-) -> Result<Vec<u8>> {
-    let domain = normalize_domain(&upstream.host);
-    if let Some(name) = domain.as_deref()
-        && routing.select_before_dns(name, upstream.port) == Some(RouteAction::Proxy)
-    {
-        ensure!(
-            upstream.protocol != Protocol::Udp,
-            "UDP DNS cannot use NaiveProxy"
-        );
-        let target = HostWithPort::new(
-            Domain::try_from(name)
-                .expect("validated DNS upstream domain")
-                .into(),
-            upstream.port,
-        );
-        tracing::info!(upstream = %upstream.name, %target, "DNS upstream routed through proxy");
-        return query_tcp_proxy(request, target, config, client).await;
+        self.cache.insert(request, &response);
+        with_id(&response, request)
     }
-    let addresses = resolver.resolve_host(&upstream.host, upstream.port).await?;
-    let mut last_error = None;
-    for address in addresses {
-        let (action, rule) = routing.select(address, normalize_domain(&upstream.host).as_deref());
-        tracing::info!(
-            upstream = %upstream.name,
-            host = %upstream.host,
-            %address,
-            port = upstream.port,
-            ?upstream.protocol,
-            ?action,
-            ?rule,
-            "DNS upstream route selected"
-        );
-        let result = match action {
-            RouteAction::Reject => Err(anyhow::anyhow!("DNS upstream rejected by routing")),
-            RouteAction::Direct => match upstream.protocol {
-                Protocol::Udp => {
-                    query_udp(
+
+    async fn query_upstream(&self, request: &[u8], upstream: &Upstream) -> Result<Vec<u8>> {
+        let domain = normalize_domain(&upstream.host);
+        if let Some(name) = domain.as_deref()
+            && self.routing.select_before_dns(name, upstream.port) == Some(RouteAction::Proxy)
+        {
+            ensure!(
+                upstream.protocol != Protocol::Udp,
+                "UDP DNS cannot use NaiveProxy"
+            );
+            let target = HostWithPort::new(
+                Domain::try_from(name)
+                    .expect("validated DNS upstream domain")
+                    .into(),
+                upstream.port,
+            );
+            tracing::info!(upstream = %upstream.name, %target, "DNS upstream routed through proxy");
+            return self.query_tcp_proxy(request, target).await;
+        }
+        let addresses = self
+            .resolver
+            .resolve_host(&upstream.host, upstream.port)
+            .await?;
+        let mut last_error = None;
+        for address in addresses {
+            let (action, rule) = self
+                .routing
+                .select(address, normalize_domain(&upstream.host).as_deref());
+            tracing::info!(
+                upstream = %upstream.name,
+                host = %upstream.host,
+                %address,
+                port = upstream.port,
+                ?upstream.protocol,
+                ?action,
+                ?rule,
+                "DNS upstream route selected"
+            );
+            let result = match action {
+                RouteAction::Reject => Err(anyhow::anyhow!("DNS upstream rejected by routing")),
+                RouteAction::Direct => match upstream.protocol {
+                    Protocol::Udp => {
+                        query_udp(
+                            request,
+                            address,
+                            Duration::from_millis(self.config.timeout_ms),
+                            self.config.max_packet_bytes,
+                            self.mark,
+                        )
+                        .await
+                    }
+                    Protocol::Tcp => self.query_tcp(request, address).await,
+                    Protocol::TcpUdp => match query_udp(
                         request,
                         address,
-                        Duration::from_millis(config.timeout_ms),
-                        config.max_packet_bytes,
-                        mark,
+                        Duration::from_millis(self.config.timeout_ms),
+                        self.config.max_packet_bytes,
+                        self.mark,
                     )
                     .await
-                }
-                Protocol::Tcp => query_tcp(request, address, config, mark).await,
-                Protocol::TcpUdp => match query_udp(
-                    request,
-                    address,
-                    Duration::from_millis(config.timeout_ms),
-                    config.max_packet_bytes,
-                    mark,
-                )
-                .await
-                {
-                    Ok(response) if !response.get(2).is_some_and(|v| v & 2 != 0) => Ok(response),
-                    _ => query_tcp(request, address, config, mark).await,
+                    {
+                        Ok(response) if !response.get(2).is_some_and(|v| v & 2 != 0) => {
+                            Ok(response)
+                        }
+                        _ => self.query_tcp(request, address).await,
+                    },
                 },
-            },
-            RouteAction::Proxy => match upstream.protocol {
-                Protocol::Udp => Err(anyhow::anyhow!("UDP DNS cannot use NaiveProxy")),
-                Protocol::Tcp | Protocol::TcpUdp => {
-                    query_tcp_proxy(request, address, config, client).await
+                RouteAction::Proxy => match upstream.protocol {
+                    Protocol::Udp => Err(anyhow::anyhow!("UDP DNS cannot use NaiveProxy")),
+                    Protocol::Tcp | Protocol::TcpUdp => {
+                        self.query_tcp_proxy(request, address).await
+                    }
+                },
+            };
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    last_error = Some(anyhow::anyhow!(
+                        "DNS upstream {address} via {action:?}: {error:#}"
+                    ))
                 }
-            },
-        };
-        match result {
-            Ok(response) => return Ok(response),
-            Err(error) => {
-                last_error = Some(anyhow::anyhow!(
-                    "DNS upstream {address} via {action:?}: {error:#}"
-                ))
             }
         }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses")))
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses")))
+
+    async fn query_tcp(&self, request: &[u8], address: SocketAddr) -> Result<Vec<u8>> {
+        timeout(Duration::from_millis(self.config.timeout_ms), async {
+            let mut stream = connect_outbound(address, self.mark).await?;
+            query_tcp_stream(&mut stream, request, self.config.max_packet_bytes).await
+        })
+        .await?
+    }
+
+    async fn query_tcp_proxy(
+        &self,
+        request: &[u8],
+        address: impl Into<Authority>,
+    ) -> Result<Vec<u8>> {
+        timeout(Duration::from_millis(self.config.timeout_ms), async {
+            let mut tunnel = self.client.connect(address).await?;
+            let (mut local, remote) = tokio::io::duplex(64 * 1024);
+            let query = query_tcp_stream(&mut local, request, self.config.max_packet_bytes);
+            tokio::pin!(query);
+            tokio::select! {
+                biased;
+                result = &mut query => result,
+                result = relay(remote, &mut tunnel.stream, tunnel.padded, Duration::from_millis(self.config.timeout_ms)) => {
+                    result?;
+                    query.await
+                }
+            }
+        })
+        .await?
+    }
 }
 
 async fn query_udp(
@@ -564,42 +556,6 @@ async fn query_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
     stream.read_exact(&mut response).await?;
     validate_response(request, &response)?;
     Ok(response)
-}
-
-async fn query_tcp(
-    request: &[u8],
-    address: SocketAddr,
-    config: &Config,
-    mark: Option<u32>,
-) -> Result<Vec<u8>> {
-    timeout(Duration::from_millis(config.timeout_ms), async {
-        let mut stream = connect_outbound(address, mark).await?;
-        query_tcp_stream(&mut stream, request, config.max_packet_bytes).await
-    })
-    .await?
-}
-
-async fn query_tcp_proxy(
-    request: &[u8],
-    address: impl Into<Authority>,
-    config: &Config,
-    client: &Client,
-) -> Result<Vec<u8>> {
-    timeout(Duration::from_millis(config.timeout_ms), async {
-        let mut tunnel = client.connect(address).await?;
-        let (mut local, remote) = tokio::io::duplex(64 * 1024);
-        let query = query_tcp_stream(&mut local, request, config.max_packet_bytes);
-        tokio::pin!(query);
-        tokio::select! {
-            biased;
-            result = &mut query => result,
-            result = relay(remote, &mut tunnel.stream, tunnel.padded, Duration::from_millis(config.timeout_ms)) => {
-                result?;
-                query.await
-            }
-        }
-    })
-    .await?
 }
 
 #[cfg(test)]
@@ -653,10 +609,10 @@ mod tests {
 
     #[tokio::test]
     async fn proxied_dns_domain_skips_local_bootstrap() {
-        let config = Config {
+        let config = Arc::new(Config {
             bootstrap: vec![],
             ..Config::default()
-        };
+        });
         let upstream = Upstream {
             host: "dns.example.invalid".into(),
             protocol: Protocol::Udp,
@@ -674,14 +630,22 @@ mod tests {
             None,
         )
         .unwrap();
-        let routing = Routing::default();
         let request = packet::make_query("example.com", 1);
         let resolver = Resolver::from_config(&config, None);
-        let error = query_upstream(
-            &request, &upstream, &config, &routing, &client, &resolver, None,
-        )
-        .await
-        .unwrap_err();
+        let context = Context::new(
+            config.clone(),
+            Arc::new(ResponseCache::new(
+                NonZeroUsize::new(config.cache_size).unwrap(),
+            )),
+            Routing::default(),
+            Arc::new(client),
+            resolver.clone(),
+            None,
+        );
+        let error = context
+            .query_upstream(&request, &upstream)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("UDP DNS cannot use NaiveProxy"));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -703,13 +667,17 @@ mod tests {
             protocol: Protocol::Tcp,
             ..upstream
         };
-        assert!(
-            query_upstream(
-                &request, &upstream, &config, &routing, &client, &resolver, None
-            )
-            .await
-            .is_err()
+        let context = Context::new(
+            config.clone(),
+            Arc::new(ResponseCache::new(
+                NonZeroUsize::new(config.cache_size).unwrap(),
+            )),
+            Routing::default(),
+            Arc::new(client),
+            resolver,
+            None,
         );
+        assert!(context.query_upstream(&request, &upstream).await.is_err());
         timeout(Duration::from_secs(3), accepted)
             .await
             .unwrap()

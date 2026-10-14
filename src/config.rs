@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::{routing::Routing, sniff::Sniff};
 
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listeners: Vec<Listener>,

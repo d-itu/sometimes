@@ -76,10 +76,7 @@ where
     }
 }
 
-pub async fn run(mut config: Config) -> Result<()> {
-    config.validate()?;
-    config.routing.prepare()?;
-    let config = Arc::new(config);
+pub async fn run(config: Arc<Config>) -> Result<()> {
     let resolver = dns::bootstrap::Resolver::from_config(&config.dns, config.outbound_mark);
     let client = Arc::new(Client::new_with_resolver(
         config.upstream.clone(),
@@ -94,9 +91,13 @@ pub async fn run(mut config: Config) -> Result<()> {
     let dns_mark = config.outbound_mark;
     let dns_routing = config.routing.clone();
     let dns_client = client.clone();
-    let mut dns_task = tokio::spawn(async move {
-        dns::run(Arc::new(dns), dns_mark, dns_routing, dns_client, resolver).await
-    });
+    let mut dns_task = tokio::spawn(dns::run(
+        Arc::new(dns),
+        dns_mark,
+        dns_routing,
+        dns_client,
+        resolver,
+    ));
     // Bind all listeners before starting any accept task.
     let listeners = config
         .listeners

@@ -19,9 +19,10 @@ async fn single_connection_limit_can_forward_http() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let mut config = (*config(Action::Direct)).clone();
+        let mut config = config(Action::Direct);
         config.max_connections = 1;
         config.listeners[0].port = address.port();
+        let config = Arc::new(config);
         let server = tokio::spawn(crate::linux::run(config));
         let mut stream = loop {
             match TcpStream::connect(address).await {
@@ -85,7 +86,7 @@ async fn continue_upload_connection_errors_and_ipv6_socks() {
     }).await.unwrap();
 }
 
-fn config(action: Action) -> Arc<Config> {
+fn config(action: Action) -> Config {
     let mut config: Config = toml::from_str(
         r#"
         listeners = [{ host = "127.0.0.1", port = 8080, protocol = "http" }]
@@ -99,10 +100,10 @@ fn config(action: Action) -> Arc<Config> {
     )
     .unwrap();
     config.routing.default = action;
-    Arc::new(config)
+    config
 }
 async fn inbound(socks_protocol: bool, action: Action) -> (TcpStream, JoinHandle<()>) {
-    let config = config(action);
+    let config = Arc::new(config(action));
     let client = Arc::new(Client::new(config.upstream.clone(), config.outbound_mark).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

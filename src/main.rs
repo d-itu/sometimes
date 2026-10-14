@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -37,14 +37,16 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Run { config } => {
-            let config = Config::load(&config)?;
+            let mut config = Config::load(&config)?;
             fmt()
                 .with_env_filter(
                     EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| EnvFilter::new(config.log.level.as_str())),
                 )
                 .init();
-            sometimes::linux::run(config).await
+            config.validate()?;
+            config.routing.prepare()?;
+            sometimes::linux::run(Arc::new(config)).await
         }
     }
 }
