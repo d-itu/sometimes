@@ -398,6 +398,14 @@ impl Context {
     }
 
     async fn query_upstream(&self, request: &[u8], upstream: &Upstream) -> Result<Vec<u8>> {
+        timeout(
+            Duration::from_millis(self.config.timeout_ms),
+            self.query_upstream_inner(request, upstream),
+        )
+        .await?
+    }
+
+    async fn query_upstream_inner(&self, request: &[u8], upstream: &Upstream) -> Result<Vec<u8>> {
         let domain = normalize_domain(&upstream.host);
         if let Some(name) = domain.as_deref()
             && self.routing.select_before_dns(name, upstream.port) == Some(RouteAction::Proxy)
@@ -575,6 +583,78 @@ mod tests {
         config.validate().unwrap();
         config.upstreams.push(config.upstreams[0].clone());
         assert!(config.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn multiple_unresponsive_addresses_share_one_query_deadline() {
+        let bootstrap = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bootstrap_address = bootstrap.local_addr().unwrap();
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        let second = UdpSocket::bind(("127.0.0.2", port)).await.unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut buffer = [0; 512];
+                let (size, peer) = bootstrap.recv_from(&mut buffer).await.unwrap();
+                let mut response = buffer[..size].to_vec();
+                response[2] |= 0x80;
+                if response[size - 4..size - 2] == [0, 1] {
+                    response[6..8].copy_from_slice(&2u16.to_be_bytes());
+                    for ip in [[127, 0, 0, 1], [127, 0, 0, 2]] {
+                        response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+                        response.extend_from_slice(&60u32.to_be_bytes());
+                        response.extend_from_slice(&[0, 4]);
+                        response.extend_from_slice(&ip);
+                    }
+                }
+                bootstrap.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let config = Arc::new(Config {
+            bootstrap: vec![bootstrap_address],
+            timeout_ms: 80,
+            ..Config::default()
+        });
+        let upstream = Upstream {
+            host: "multi.example".into(),
+            port,
+            ..Upstream::default()
+        };
+        let client = Arc::new(
+            Client::new(
+                crate::config::Upstream {
+                    host: "127.0.0.1".into(),
+                    port: 443,
+                    server_name: None,
+                    username: "user".into(),
+                    password: "pass".into(),
+                    require_padding: true,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let context = Context::new(
+            config.clone(),
+            Arc::new(ResponseCache::new(NonZeroUsize::new(1).unwrap())),
+            Routing {
+                default: RouteAction::Direct,
+                ..Routing::default()
+            },
+            client,
+            Resolver::from_config(&config, None),
+            None,
+        );
+        let request = packet::make_query("example.com", 1);
+        let result = timeout(
+            Duration::from_millis(150),
+            context.query_upstream(&request, &upstream),
+        )
+        .await
+        .expect("all addresses must share the configured deadline");
+        assert!(result.is_err());
+        server.await.unwrap();
+        drop((first, second));
     }
 
     #[tokio::test]
