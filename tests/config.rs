@@ -19,6 +19,7 @@ fn hostname_and_ip_default_to_https_port() {
     for host in ["proxy.example.com", "192.0.2.1", "2001:db8::1"] {
         let config = upstream(host, None, None);
         assert!(config.server_name.is_none());
+        assert!(config.require_padding);
         assert_eq!(config.host, host);
         assert_eq!(config.port, 443);
         Client::new(config, None).unwrap();

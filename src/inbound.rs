@@ -55,7 +55,7 @@ struct State {
 }
 
 // The bounded bridge applies Naive framing once, independently of the inbound protocol.
-enum Transport {
+pub(crate) enum Transport {
     Direct(TcpStream),
     Proxy(DuplexStream),
 }
@@ -113,9 +113,14 @@ impl AsyncWrite for Egress {
         }
     }
 }
-fn tunnel_transport(mut tunnel: Tunnel, idle: Duration) -> (Transport, Option<JoinHandle<()>>) {
+pub(crate) fn tunnel_transport(
+    tunnel: Tunnel,
+    idle: Duration,
+) -> (Transport, Option<JoinHandle<()>>) {
     let (local, remote) = tokio::io::duplex(64 * 1024);
     let driver = tokio::spawn(async move {
+        // Capture the whole tunnel so the relay retains its session and stream permit.
+        let mut tunnel = tunnel;
         if let Err(error) = relay(remote, &mut tunnel.stream, tunnel.padded, idle).await {
             tracing::debug!(%error, "Naive bridge ended");
         }

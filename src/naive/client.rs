@@ -1,14 +1,32 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    error::Error,
+    fmt,
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc, Mutex as StdMutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rama::{
+    extensions::{Extensions, ExtensionsRef},
     http::{
         Body, HeaderValue, Method, Request, Version,
         core::client::conn::http2,
         io::upgrade::{Upgraded, handle_upgrade},
     },
-    net::{address::Authority, uri::Uri},
+    net::{
+        address::Authority,
+        conn::{ConnectionHealth, ConnectionHealthWatcher, MaxConcurrency},
+        uri::Uri,
+    },
     rt::Executor,
     tcp::TcpStream,
     tls::rustls::{
@@ -19,7 +37,12 @@ use rama::{
         },
     },
 };
-use tokio::task::JoinHandle;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+    time::timeout,
+};
 
 use crate::{
     config::Upstream,
@@ -34,22 +57,155 @@ pub struct Client {
     authorization: HeaderValue,
     server_name: ServerName<'static>,
     resolver: Arc<Resolver>,
+    sessions: Mutex<Vec<Arc<Session>>>,
+    slots: Arc<Semaphore>,
+    changed: Arc<Notify>,
+    pending: Arc<Semaphore>,
 }
 
-/// Owns the H2 driver so cancellation cannot leak background connections.
 pub struct Tunnel {
     pub stream: Upgraded,
     pub padded: bool,
-    driver: JoinHandle<()>,
+    _session: Arc<Session>,
+    _permit: StreamPermit,
 }
 
-impl Drop for Tunnel {
-    fn drop(&mut self) {
-        self.driver.abort();
+struct Session {
+    address: Option<SocketAddr>,
+    sender: http2::SendRequest<Body>,
+    _driver: Driver,
+    streams: Arc<Semaphore>,
+    admission: StdMutex<()>,
+    max_streams: Arc<MaxConcurrency>,
+    health: Arc<ConnectionHealthWatcher>,
+    draining: AtomicBool,
+    changed: Arc<Notify>,
+    _slot: Arc<Option<Slot>>,
+}
+
+struct PoolPolicy;
+
+impl PoolPolicy {
+    const CONNECTIONS: usize = 4;
+    const STREAMS: usize = 64;
+    const PENDING: usize = 128;
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+}
+
+enum Assignment {
+    Stream(Arc<Session>, StreamPermit),
+    Connection(Slot),
+    Unavailable,
+}
+
+enum Allocation {
+    Any,
+    Available,
+    Existing,
+    Waiting,
+    Retry,
+}
+
+struct ConnectRequest<'a> {
+    client: &'a Client,
+    destination: Authority,
+    failed: Vec<Weak<Session>>,
+}
+
+enum ConnectionProgress<T> {
+    Ready(T),
+    Reused(Arc<Session>, StreamPermit),
+}
+
+// Field order closes the transport before releasing its connection budget.
+struct ReservedIo<S> {
+    stream: S,
+    _slot: Arc<Option<Slot>>,
+}
+
+impl<S: ExtensionsRef> ExtensionsRef for ReservedIo<S> {
+    fn extensions(&self) -> &Extensions {
+        self.stream.extensions()
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ReservedIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ReservedIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
 struct Driver(Option<JoinHandle<()>>);
+
+struct Slot {
+    permit: Option<OwnedSemaphorePermit>,
+    changed: Arc<Notify>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.changed.notify_waiters();
+    }
+}
+
+struct StreamPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    changed: Arc<Notify>,
+}
+
+impl Drop for StreamPermit {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.changed.notify_waiters();
+    }
+}
+
+#[derive(Debug)]
+struct UnsentConnect;
+
+impl fmt::Display for UnsentConnect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("upstream CONNECT was not sent")
+    }
+}
+
+impl Error for UnsentConnect {}
+
 impl Drop for Driver {
     fn drop(&mut self) {
         if let Some(task) = &self.0 {
@@ -95,43 +251,151 @@ impl Client {
             authorization,
             server_name,
             resolver,
+            sessions: Mutex::new(Vec::new()),
+            slots: Arc::new(Semaphore::new(PoolPolicy::CONNECTIONS)),
+            changed: Arc::new(Notify::new()),
+            pending: Arc::new(Semaphore::new(PoolPolicy::PENDING)),
         })
     }
 
     pub async fn connect(&self, destination: impl Into<Authority>) -> Result<Tunnel> {
-        let addresses = self
-            .resolver
-            .resolve_host(&self.upstream.host, self.upstream.port)
-            .await
-            .context("resolve upstream hostname")?;
-        self.connect_addresses(addresses, destination.into()).await
+        let _pending = self
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .context("upstream CONNECT queue full")?;
+        ConnectRequest::new(self, destination.into()).run().await
     }
 
-    async fn connect_addresses(
-        &self,
-        addresses: impl IntoIterator<Item = SocketAddr>,
-        destination: Authority,
-    ) -> Result<Tunnel> {
-        let mut last_error = None;
-        for address in addresses {
-            match connect_outbound(address, self.outbound_mark).await {
-                Ok(tcp) => match self
-                    .handshake(TcpStream::new(tcp), destination.clone())
-                    .await
-                {
-                    Ok(tunnel) => return Ok(tunnel),
-                    Err(error) => last_error = Some(error.context(format!("upstream {address}"))),
-                },
-                Err(error) => last_error = Some(error.into()),
+    async fn assign(&self, allocation: Allocation, excluded: &[Weak<Session>]) -> Assignment {
+        let mut retiring: Option<Weak<Option<Slot>>> = None;
+        let eligible = |session: &Arc<Session>| {
+            !excluded
+                .iter()
+                .any(|failed| failed.as_ptr() == Arc::as_ptr(session))
+        };
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut sessions = self.sessions.lock().await;
+            if matches!(allocation, Allocation::Retry)
+                && let Some(failed) = excluded.last()
+                && let Some(session) = failed.upgrade()
+                && !session.usable()
+                && session.active() == 0
+            {
+                // Cleanup may remove this session before its transport releases the slot.
+                retiring = Some(Arc::downgrade(&session._slot));
             }
-        }
-        match last_error {
-            Some(error) => Err(error).context("connect to upstream addresses"),
-            None => anyhow::bail!("upstream hostname resolved to no addresses"),
+            sessions.retain(|session| session.usable() || session.active() > 0);
+            let available = sessions
+                .iter()
+                .filter(|session| eligible(session))
+                .find_map(|session| {
+                    session
+                        .try_acquire()
+                        .map(|permit| (session.clone(), permit))
+                });
+            if let Some((session, permit)) = available {
+                drop(sessions);
+                return Assignment::Stream(session, permit);
+            }
+            if matches!(allocation, Allocation::Available)
+                || matches!(allocation, Allocation::Existing)
+                    && !sessions
+                        .iter()
+                        .any(|session| session.usable() && eligible(session))
+            {
+                return Assignment::Unavailable;
+            }
+            if matches!(allocation, Allocation::Retry)
+                && self.slots.available_permits() == 0
+                && retiring
+                    .as_ref()
+                    .is_none_or(|lease| lease.strong_count() == 0)
+            {
+                // Retire this request's failed session before considering unrelated sessions.
+                let preferred_index = excluded.last().and_then(|failed| {
+                    sessions
+                        .iter()
+                        .position(|session| failed.ptr_eq(&Arc::downgrade(session)))
+                });
+                let index = match preferred_index {
+                    Some(index) => (sessions[index].active() == 0).then_some(index),
+                    None => sessions.iter().position(|session| session.active() == 0),
+                };
+                if let Some(index) = index {
+                    let session = sessions.swap_remove(index);
+                    session.draining.store(true, Ordering::Relaxed);
+                    retiring = Some(Arc::downgrade(&session._slot));
+                    self.changed.notify_waiters();
+                }
+            }
+            let slot = (!matches!(allocation, Allocation::Existing | Allocation::Waiting))
+                .then(|| {
+                    self.slots
+                        .clone()
+                        .try_acquire_owned()
+                        .ok()
+                        .map(|permit| Slot {
+                            permit: Some(permit),
+                            changed: self.changed.clone(),
+                        })
+                })
+                .flatten();
+            drop(sessions);
+            if let Some(slot) = slot {
+                return Assignment::Connection(slot);
+            }
+            notified.await;
         }
     }
 
+    async fn publish_session(&self, session: Arc<Session>) {
+        self.sessions.lock().await.push(session);
+        self.changed.notify_waiters();
+    }
+
+    async fn establish(
+        &self,
+        address: SocketAddr,
+        slot: &mut Option<Slot>,
+    ) -> Result<Arc<Session>> {
+        timeout(PoolPolicy::ATTEMPT_TIMEOUT, async {
+            let tcp = connect_outbound(address, self.outbound_mark).await?;
+            self.handshake_session_reserved(TcpStream::new(tcp), Some(address), slot.take())
+                .await
+        })
+        .await
+        .context("upstream connection attempt timed out")?
+    }
+
+    #[cfg(test)]
     async fn handshake(&self, tcp: TcpStream, destination: Authority) -> Result<Tunnel> {
+        let session = self.handshake_session(tcp).await?;
+        let permit = session.acquire().await?;
+        session
+            .connect(
+                destination,
+                self.authorization.clone(),
+                self.upstream.require_padding,
+                permit,
+            )
+            .await
+    }
+
+    #[cfg(test)]
+    async fn handshake_session(&self, tcp: TcpStream) -> Result<Arc<Session>> {
+        self.handshake_session_reserved(tcp, None, None).await
+    }
+
+    async fn handshake_session_reserved(
+        &self,
+        tcp: TcpStream,
+        address: Option<SocketAddr>,
+        slot: Option<Slot>,
+    ) -> Result<Arc<Session>> {
         let tls = self
             .tls
             .connect(self.server_name.clone(), tcp)
@@ -141,13 +405,173 @@ impl Client {
             tls.get_ref().1.alpn_protocol() == Some(b"h2"),
             "upstream did not negotiate h2"
         );
-        connect_h2(
-            TlsStream::new(tls),
+        Session::handshake_reserved(TlsStream::new(tls), self.changed.clone(), address, slot).await
+    }
+}
+
+impl<'a> ConnectRequest<'a> {
+    fn new(client: &'a Client, destination: Authority) -> Self {
+        Self {
+            client,
             destination,
-            self.authorization.clone(),
-            self.upstream.require_padding,
-        )
-        .await
+            failed: Vec::new(),
+        }
+    }
+
+    async fn assign(&self, allocation: Allocation) -> Assignment {
+        self.client.assign(allocation, &self.failed).await
+    }
+
+    async fn while_connecting<F: Future>(&self, work: F) -> ConnectionProgress<F::Output> {
+        tokio::select! {
+            // Publish a completed handshake before considering another pooled session.
+            biased;
+            result = work => ConnectionProgress::Ready(result),
+            assignment = self.assign(Allocation::Waiting) => match assignment {
+                Assignment::Stream(session, permit) => ConnectionProgress::Reused(session, permit),
+                _ => unreachable!("waiting allocation only returns existing streams"),
+            },
+        }
+    }
+
+    async fn send(&mut self, session: Arc<Session>, permit: StreamPermit) -> Result<Tunnel> {
+        let address = session.address;
+        let failed = Arc::downgrade(&session);
+        let result = session
+            .connect(
+                self.destination.clone(),
+                self.client.authorization.clone(),
+                self.client.upstream.require_padding,
+                permit,
+            )
+            .await;
+        if result.is_err() {
+            self.failed.push(failed);
+        }
+        match address {
+            Some(address) => result.with_context(|| format!("upstream {address}")),
+            None => result,
+        }
+    }
+
+    async fn stream(&self) -> Result<(Arc<Session>, StreamPermit)> {
+        match self.assign(Allocation::Existing).await {
+            Assignment::Stream(session, permit) => Ok((session, permit)),
+            Assignment::Unavailable => Err(UnsentConnect.into()),
+            Assignment::Connection(_) => {
+                unreachable!("existing allocation cannot create connections")
+            }
+        }
+    }
+
+    async fn run(mut self) -> Result<Tunnel> {
+        loop {
+            let allocation = if self.failed.is_empty() {
+                Allocation::Any
+            } else {
+                Allocation::Retry
+            };
+            let (session, permit) = match self.assign(allocation).await {
+                Assignment::Stream(session, permit) => (session, permit),
+                Assignment::Connection(slot) => {
+                    let resolving = self
+                        .client
+                        .resolver
+                        .resolve_host(&self.client.upstream.host, self.client.upstream.port);
+                    match self.while_connecting(resolving).await {
+                        ConnectionProgress::Ready(Ok(addresses)) => {
+                            return self.addresses(addresses, slot).await;
+                        }
+                        ConnectionProgress::Ready(Err(error)) => {
+                            drop(slot);
+                            match self.assign(Allocation::Available).await {
+                                Assignment::Stream(session, permit) => (session, permit),
+                                Assignment::Unavailable => {
+                                    return Err(error).context("resolve upstream hostname");
+                                }
+                                Assignment::Connection(_) => {
+                                    unreachable!("available allocation cannot create connections")
+                                }
+                            }
+                        }
+                        ConnectionProgress::Reused(session, permit) => {
+                            drop(slot);
+                            (session, permit)
+                        }
+                    }
+                }
+                Assignment::Unavailable => unreachable!("pool allocation can create connections"),
+            };
+            if let Ok(tunnel) = self.send(session, permit).await {
+                return Ok(tunnel);
+            }
+        }
+    }
+
+    async fn addresses(
+        mut self,
+        addresses: impl IntoIterator<Item = SocketAddr>,
+        slot: Slot,
+    ) -> Result<Tunnel> {
+        let mut last_error = None;
+        let mut slot = Some(slot);
+        let mut addresses = addresses.into_iter().peekable();
+        ensure!(
+            addresses.peek().is_some(),
+            "upstream hostname resolved to no addresses"
+        );
+        loop {
+            let Some(&address) = addresses.peek() else {
+                drop(slot.take());
+                // All establishment outcomes share the final pooled-capacity wait.
+                let Ok((session, permit)) = self.stream().await else {
+                    break;
+                };
+                match self.send(session, permit).await {
+                    Ok(tunnel) => return Ok(tunnel),
+                    Err(error) => last_error = Some(error),
+                }
+                continue;
+            };
+            let allocation = match slot.take() {
+                Some(reserved) => Assignment::Connection(reserved),
+                None => self.assign(Allocation::Retry).await,
+            };
+            let progress = match allocation {
+                Assignment::Stream(session, permit) => ConnectionProgress::Reused(session, permit),
+                Assignment::Connection(reserved) => {
+                    slot = Some(reserved);
+                    let establishing = self.client.establish(address, &mut slot);
+                    self.while_connecting(establishing).await
+                }
+                Assignment::Unavailable => unreachable!("retry allocation can create connections"),
+            };
+            let (session, permit) = match progress {
+                ConnectionProgress::Reused(session, permit) => {
+                    // Cancellation leaves this address eligible for a later attempt.
+                    drop(slot.take());
+                    (session, permit)
+                }
+                ConnectionProgress::Ready(result) => {
+                    addresses.next();
+                    match result {
+                        Ok(session) => self.client.publish_session(session).await,
+                        Err(error) => {
+                            last_error = Some(error.context(format!("upstream {address}")));
+                        }
+                    }
+                    continue;
+                }
+            };
+            match self.send(session, permit).await {
+                Ok(tunnel) => return Ok(tunnel),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error).context("connect to upstream addresses"),
+            None => Err(UnsentConnect).context("connect to upstream addresses"),
+        }
     }
 }
 
@@ -163,52 +587,181 @@ pub async fn connect_h2<S>(
 where
     S: rama::io::Io + rama::extensions::ExtensionsRef + Unpin,
 {
-    let (mut sender, connection) = http2::Builder::new(Executor::new())
-        .with_enable_push(false)
-        .with_max_send_buf_size(64 * 1024)
-        .handshake::<_, Body>(stream)
+    let session = Session::handshake(stream, Arc::new(Notify::new())).await?;
+    let permit = session.acquire().await?;
+    session
+        .connect(destination.into(), authorization, require_padding, permit)
         .await
-        .context("H2 handshake")?;
-    let mut driver = Driver(Some(tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::debug!(%error, "upstream H2 connection closed");
-        }
-    })));
+}
 
-    // Characters from the long-code region of the HPACK Huffman table.
-    let padding: String = (0..rand::random_range(16..=32))
-        .map(|_| ['!', '"', '#', '$', '\''][rand::random_range(0..5)])
-        .collect();
-    let mut padding = HeaderValue::from_str(&padding)?;
-    padding.set_sensitive(true);
-    let request = Request::builder()
-        .method(Method::CONNECT)
-        .version(Version::HTTP_2)
-        .uri(Uri::from_authority_form(destination.into()))
-        .header("proxy-authorization", authorization)
-        .header("padding", padding)
-        .body(Body::empty())?;
-    let response = sender
-        .send_request(request)
-        .await
-        .context("CONNECT request")?;
-    ensure!(
-        response.status().is_success(),
-        "upstream CONNECT rejected: {}",
-        response.status()
-    );
-    let padded = response.headers().contains_key("padding");
-    ensure!(
-        padded || !require_padding,
-        "upstream did not negotiate NaiveProxy padding"
-    );
-    let stream = handle_upgrade(&response)
-        .await
-        .map_err(anyhow::Error::from_boxed)
-        .context("CONNECT tunnel upgrade")?;
-    Ok(Tunnel {
-        stream,
-        padded,
-        driver: driver.0.take().expect("driver exists until transfer"),
-    })
+impl Session {
+    fn usable(&self) -> bool {
+        !self.sender.is_closed()
+            && !self.draining.load(Ordering::Relaxed)
+            && self.health.health() == ConnectionHealth::Healthy
+    }
+
+    fn active(&self) -> usize {
+        PoolPolicy::STREAMS - self.streams.available_permits()
+    }
+
+    fn try_acquire(&self) -> Option<StreamPermit> {
+        // Serialize the peer-limit check with permit acquisition.
+        let _admission = self.admission.lock().expect("admission mutex poisoned");
+        let limit = self.max_streams.get();
+        if !self.usable() || self.active() >= limit {
+            return None;
+        }
+        let permit = self.streams.clone().try_acquire_owned().ok()?;
+        Some(StreamPermit {
+            permit: Some(permit),
+            changed: self.changed.clone(),
+        })
+    }
+
+    async fn acquire(&self) -> Result<StreamPermit> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            ensure!(self.usable(), UnsentConnect);
+            if let Some(permit) = self.try_acquire() {
+                return Ok(permit);
+            }
+            notified.await;
+        }
+    }
+
+    async fn handshake<S>(stream: S, changed: Arc<Notify>) -> Result<Arc<Self>>
+    where
+        S: rama::io::Io + rama::extensions::ExtensionsRef + Unpin,
+    {
+        Self::handshake_reserved(stream, changed, None, None).await
+    }
+
+    async fn handshake_reserved<S>(
+        stream: S,
+        changed: Arc<Notify>,
+        address: Option<SocketAddr>,
+        slot: Option<Slot>,
+    ) -> Result<Arc<Self>>
+    where
+        S: rama::io::Io + ExtensionsRef + Unpin,
+    {
+        let slot = Arc::new(slot);
+        let stream = ReservedIo {
+            stream,
+            _slot: slot.clone(),
+        };
+        // Subscribe before the handshake can process the first SETTINGS frame.
+        let max_streams = stream
+            .extensions()
+            .insert_arc(Arc::new(MaxConcurrency::new(usize::MAX)));
+        let mut capacity = max_streams.watch();
+        let health = stream
+            .extensions()
+            .get_arc_or_insert(|| Arc::new(ConnectionHealthWatcher::default()));
+        let mut health_changes = health.watch();
+        let (sender, connection) = http2::Builder::new(Executor::new())
+            .with_enable_push(false)
+            .with_max_send_buf_size(64 * 1024)
+            .handshake::<_, Body>(stream)
+            .await
+            .context("H2 handshake")?;
+        let peer_settings = connection.peer_settings_handle();
+        let closed = health.clone();
+        let signal = changed.clone();
+        let driver = Driver(Some(tokio::spawn(async move {
+            tokio::pin!(connection);
+            loop {
+                tokio::select! {
+                    result = &mut connection => {
+                        if let Err(error) = result {
+                            tracing::debug!(%error, "upstream H2 connection closed");
+                        }
+                        closed.mark_broken();
+                        signal.notify_waiters();
+                        break;
+                    }
+                    Some(_) = capacity.changed() => signal.notify_waiters(),
+                    Some(_) = health_changes.changed() => signal.notify_waiters(),
+                }
+            }
+        })));
+        peer_settings
+            .await_settings()
+            .await
+            .context("upstream closed before initial H2 SETTINGS")?;
+        Ok(Arc::new(Self {
+            address,
+            sender,
+            _driver: driver,
+            streams: Arc::new(Semaphore::new(PoolPolicy::STREAMS)),
+            admission: StdMutex::new(()),
+            max_streams,
+            health,
+            draining: AtomicBool::new(false),
+            changed,
+            _slot: slot,
+        }))
+    }
+
+    async fn connect(
+        self: Arc<Self>,
+        destination: Authority,
+        authorization: HeaderValue,
+        require_padding: bool,
+        permit: StreamPermit,
+    ) -> Result<Tunnel> {
+        // Characters from the long-code region of the HPACK Huffman table.
+        let padding: String = (0..rand::random_range(16..=32))
+            .map(|_| ['!', '"', '#', '$', '\''][rand::random_range(0..5)])
+            .collect();
+        let mut padding = HeaderValue::from_str(&padding)?;
+        padding.set_sensitive(true);
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_2)
+            .uri(Uri::from_authority_form(destination))
+            .header("proxy-authorization", authorization)
+            .header("padding", padding)
+            .body(Body::empty())?;
+        let response = match self.sender.clone().try_send_request(request).await {
+            Ok(response) => response,
+            Err(mut error) => {
+                let unsent = error.take_message().is_some();
+                let error = error.into_error();
+                if unsent || error.is_closed() {
+                    self.draining.store(true, Ordering::Relaxed);
+                    self.changed.notify_waiters();
+                }
+                let error = anyhow::Error::new(error);
+                return if unsent {
+                    Err(error.context(UnsentConnect).context("CONNECT request"))
+                } else {
+                    Err(error.context("CONNECT request"))
+                };
+            }
+        };
+        ensure!(
+            response.status().is_success(),
+            "upstream CONNECT rejected: {}",
+            response.status()
+        );
+        let padded = response.headers().contains_key("padding");
+        ensure!(
+            padded || !require_padding,
+            "upstream did not negotiate NaiveProxy padding"
+        );
+        let stream = handle_upgrade(&response)
+            .await
+            .map_err(anyhow::Error::from_boxed)
+            .context("CONNECT tunnel upgrade")?;
+        Ok(Tunnel {
+            stream,
+            padded,
+            _session: self,
+            _permit: permit,
+        })
+    }
 }

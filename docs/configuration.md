@@ -6,7 +6,10 @@ Copy `examples/sometimes.toml` to `sometimes.toml`, replace the upstream host an
 
 `upstream.host` accepts a hostname or IP without a port. IPv6 uses the unbracketed form, such as `2001:db8::1`. `upstream.port` defaults to `443` and can be overridden with a nonzero port, such as `8443`.
 
-The hostname is used for TLS SNI and certificate verification by default. `server_name` overrides it when connecting to a fixed IP. Hostnames are resolved with the system resolver for each new connection, and resolved addresses are attempted sequentially on TCP, TLS, H2, or CONNECT failure. The connection deadline includes resolution, TCP, TLS, and CONNECT. No tunnel payload is replayed.
+The hostname is used for TLS SNI and certificate verification by default. `server_name` overrides it when connecting to
+a fixed IP. The upstream hostname is resolved through the configured bootstrap DNS servers. Resolved addresses are
+retried on connection failure. The configured connection deadline bounds the entire operation, including capacity waits,
+DNS resolution, TCP, TLS, CONNECT, and retries. No tunnel payload is replayed.
 
 Padding is required by default. Set `require_padding = false` only to deliberately permit a standard H2 CONNECT proxy that does not advertise padding.
 

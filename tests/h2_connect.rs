@@ -117,7 +117,7 @@ async fn h2_connect_with_padding_and_half_close() {
 }
 
 #[tokio::test]
-async fn padding_is_required_by_default() {
+async fn missing_padding_is_rejected_when_required() {
     timeout(Duration::from_secs(5), exercise(200, false, true))
         .await
         .unwrap();
