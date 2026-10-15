@@ -28,5 +28,3 @@ This is an initial working prototype, not a production release. It implements:
 Each proxied TCP flow currently opens a separate upstream TLS/H2 session. Session pooling, reconnect backoff, fingerprint tuning, HTTP/3, and UDP tunneling remain future work. There is no direct fallback when an intercepted connection fails. Wire compatibility does not imply Chromium fingerprint equivalence.
 
 Tests use a custom Rama H2 peer with handwritten padding fixtures, a generated TLS certificate, and real Linux TPROXY in an isolated namespace. Interoperability with a deployed third-party NaiveProxy server has not yet been tested.
-
-See [development](development.md), [configuration](configuration.md), [deployment](deployment.md), and [roadmap](roadmap.md) for operational details.
