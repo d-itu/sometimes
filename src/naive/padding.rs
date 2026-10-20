@@ -1,41 +1,191 @@
 //! Independent implementation of the published NaiveProxy payload padding format.
 //!
 //! Record counts belong to each direction of a CONNECT stream, not to H2 frames.
-use std::io;
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 const FIRST_RECORDS: usize = 8;
 const CHUNK: usize = 16 * 1024;
+
+/// Applies the initial padding records directly to an underlying byte stream.
+///
+/// Writes buffer at most one record; flush or shutdown drains any pending bytes.
+/// The encoding buffer is released after the eighth record.
+pub struct PaddingIo<T> {
+    inner: T,
+    read: ReadState,
+    write: WriteState,
+}
+
+#[derive(Default)]
+struct ReadState {
+    records: usize,
+    header: [u8; 3],
+    header_len: usize,
+    payload: usize,
+    padding: usize,
+}
+
+#[derive(Default)]
+struct WriteState {
+    records: usize,
+    buffer: Vec<u8>,
+    position: usize,
+}
+
+impl<T> PaddingIo<T> {
+    pub fn new(inner: T, padded: bool) -> Self {
+        let records = if padded { FIRST_RECORDS } else { 0 };
+        Self {
+            inner,
+            read: ReadState {
+                records,
+                ..ReadState::default()
+            },
+            write: WriteState {
+                records,
+                ..WriteState::default()
+            },
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for PaddingIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let Self { inner, read, .. } = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        while read.records > 0 {
+            while read.header_len < 3 {
+                let mut header = ReadBuf::new(&mut read.header[read.header_len..]);
+                ready!(Pin::new(&mut *inner).poll_read(cx, &mut header))?;
+                let len = header.filled().len();
+                if len == 0 {
+                    return if read.header_len == 0 {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()))
+                    };
+                }
+                read.header_len += len;
+                if read.header_len == 3 {
+                    read.payload =
+                        usize::from(u16::from_be_bytes([read.header[0], read.header[1]]));
+                    read.padding = usize::from(read.header[2]);
+                }
+            }
+            if read.payload > 0 {
+                let limit = buf.remaining().min(read.payload);
+                let mut payload = ReadBuf::new(buf.initialize_unfilled_to(limit));
+                ready!(Pin::new(&mut *inner).poll_read(cx, &mut payload))?;
+                let len = payload.filled().len();
+                if len == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+                }
+                read.payload -= len;
+                buf.advance(len);
+                return Poll::Ready(Ok(()));
+            }
+            while read.padding > 0 {
+                let mut discarded = [0; 255];
+                let mut padding = ReadBuf::new(&mut discarded[..read.padding]);
+                ready!(Pin::new(&mut *inner).poll_read(cx, &mut padding))?;
+                let len = padding.filled().len();
+                if len == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+                }
+                read.padding -= len;
+            }
+            read.records -= 1;
+            read.header_len = 0;
+        }
+        Pin::new(inner).poll_read(cx, buf)
+    }
+}
+
+impl WriteState {
+    fn poll_drain<T: AsyncWrite + Unpin>(
+        &mut self,
+        inner: &mut T,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        while self.position < self.buffer.len() {
+            let len = ready!(Pin::new(&mut *inner).poll_write(cx, &self.buffer[self.position..]))?;
+            if len == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            self.position += len;
+        }
+        if self.records == 0 {
+            self.buffer = Vec::new();
+        } else {
+            self.buffer.clear();
+        }
+        self.position = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for PaddingIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let Self { inner, write, .. } = self.get_mut();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        ready!(write.poll_drain(inner, cx))?;
+        if write.records == 0 {
+            return Pin::new(inner).poll_write(cx, buf);
+        }
+        let len = buf.len().min(CHUNK);
+        let padding = rand::random::<u8>();
+        write.buffer.reserve(CHUNK + 3 + 255);
+        write.buffer.extend_from_slice(&(len as u16).to_be_bytes());
+        write.buffer.push(padding);
+        write.buffer.extend_from_slice(&buf[..len]);
+        write.buffer.resize(len + 3 + usize::from(padding), 0);
+        write.records -= 1;
+        if let Poll::Ready(result) = write.poll_drain(inner, cx) {
+            result?;
+        }
+        Poll::Ready(Ok(len))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Self { inner, write, .. } = self.get_mut();
+        ready!(write.poll_drain(inner, cx))?;
+        Pin::new(inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Self { inner, write, .. } = self.get_mut();
+        ready!(write.poll_drain(inner, cx))?;
+        Pin::new(inner).poll_shutdown(cx)
+    }
+}
 
 pub async fn encode<R, W>(reader: &mut R, writer: &mut W, padded: bool) -> io::Result<u64>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = [0u8; CHUNK + 3 + 255];
-    let mut total = 0;
-    let mut remaining = if padded { FIRST_RECORDS } else { 0 };
-    loop {
-        let len = reader.read(&mut buffer[3..3 + CHUNK]).await?;
-        if len == 0 {
-            writer.shutdown().await?;
-            return Ok(total);
-        }
-        if remaining > 0 {
-            let padding = rand::random::<u8>();
-            buffer[..2].copy_from_slice(&(len as u16).to_be_bytes());
-            buffer[2] = padding;
-            buffer[3 + len..3 + len + usize::from(padding)].fill(0);
-            writer
-                .write_all(&buffer[..3 + len + usize::from(padding)])
-                .await?;
-            remaining -= 1;
-        } else {
-            writer.write_all(&buffer[3..3 + len]).await?;
-        }
-        total += len as u64;
-    }
+    let mut writer = PaddingIo::new(writer, padded);
+    let total = tokio::io::copy(reader, &mut writer).await?;
+    writer.shutdown().await?;
+    Ok(total)
 }
 
 pub async fn decode<R, W>(reader: &mut R, writer: &mut W, padded: bool) -> io::Result<u64>
@@ -43,32 +193,8 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = [0u8; CHUNK];
-    let mut total = 0;
-    if padded {
-        for _ in 0..FIRST_RECORDS {
-            let mut header = [0u8; 3];
-            // EOF at a record boundary is a valid half-close, even before record eight.
-            if reader.read(&mut header[..1]).await? == 0 {
-                writer.shutdown().await?;
-                return Ok(total);
-            }
-            reader.read_exact(&mut header[1..]).await?;
-            let len = usize::from(u16::from_be_bytes([header[0], header[1]]));
-            let mut remaining = len;
-            while remaining > 0 {
-                let size = remaining.min(CHUNK);
-                reader.read_exact(&mut buffer[..size]).await?;
-                writer.write_all(&buffer[..size]).await?;
-                remaining -= size;
-            }
-            reader
-                .read_exact(&mut buffer[..usize::from(header[2])])
-                .await?;
-            total += len as u64;
-        }
-    }
-    total += tokio::io::copy(reader, writer).await?;
+    let mut reader = PaddingIo::new(reader, padded);
+    let total = tokio::io::copy(&mut reader, writer).await?;
     writer.shutdown().await?;
     Ok(total)
 }

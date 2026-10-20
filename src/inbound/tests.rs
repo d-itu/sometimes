@@ -10,6 +10,7 @@ use rama::http::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    task::JoinHandle,
 };
 
 #[tokio::test]
@@ -25,7 +26,7 @@ async fn resolved_addresses_retry_direct_and_recheck_routing() {
             client: client.clone(),
             permits: Arc::new(Semaphore::new(1)),
         };
-        let (transport, _) = state
+        let transport = state
             .connect_resolved([unavailable, destination], Some("example.test"))
             .await
             .unwrap();
@@ -413,32 +414,76 @@ trait TestIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> TestIo for T {}
 
 #[tokio::test]
-async fn http_over_padded_naive_bridge() {
+async fn http_over_padded_naive_transport() {
     timeout(Duration::from_secs(8), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            server_h2::Builder::new(Executor::default()).serve_connection(RamaTcpStream::new(stream), service_fn(|req: Request<Incoming>| async move {
+            let service = service_fn(|req: Request<Incoming>| async move {
                 tokio::spawn(async move {
                     let mut tunnel = handle_upgrade(&req).await.unwrap();
                     let mut request = Vec::new();
                     while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                        let size = tunnel.read_u16().await.unwrap() as usize; let padding = tunnel.read_u8().await.unwrap() as usize;
-                        let mut record = vec![0; size + padding]; tunnel.read_exact(&mut record).await.unwrap(); request.extend_from_slice(&record[..size]);
+                        let size = tunnel.read_u16().await.unwrap() as usize;
+                        let padding = tunnel.read_u8().await.unwrap() as usize;
+                        let mut record = vec![0; size + padding];
+                        tunnel.read_exact(&mut record).await.unwrap();
+                        request.extend_from_slice(&record[..size]);
                     }
                     assert!(request.starts_with(b"GET /padding HTTP/1.1\r\n"));
-                    let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\npadded";
-                    tunnel.write_u16(reply.len() as u16).await.unwrap(); tunnel.write_u8(2).await.unwrap(); tunnel.write_all(reply).await.unwrap(); tunnel.write_all(&[0, 0]).await.unwrap(); tunnel.shutdown().await.unwrap();
+                    let reply =
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\npadded";
+                    tunnel.write_u16(reply.len() as u16).await.unwrap();
+                    tunnel.write_u8(2).await.unwrap();
+                    tunnel.write_all(reply).await.unwrap();
+                    tunnel.write_all(&[0, 0]).await.unwrap();
+                    tunnel.shutdown().await.unwrap();
+                    let mut tail = Vec::new();
+                    tunnel.read_to_end(&mut tail).await.unwrap();
+                    assert!(tail.is_empty());
                 });
-                Ok::<_, Infallible>(Response::builder().header("padding", "yes").body(Body::empty()).unwrap())
-            })).await.unwrap();
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .header("padding", "yes")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+            });
+            server_h2::Builder::new(Executor::default())
+                .serve_connection(RamaTcpStream::new(stream), service)
+                .await
+                .unwrap();
         });
-        let tunnel = crate::naive::client::connect_h2(RamaTcpStream::new(TcpStream::connect(address).await.unwrap()), "127.0.0.1:80".parse::<SocketAddr>().unwrap(), HeaderValue::from_static("Basic dXNlcjpwYXNz"), true).await.unwrap();
-        let (transport, driver) = tunnel_transport(tunnel, Duration::from_secs(3));
-        let upstream = Egress { transport, driver, extensions: Extensions::new(), _permit: Arc::new(tokio::sync::Semaphore::new(1)).try_acquire_owned().unwrap() };
-        let (mut sender, conn) = http1::handshake(upstream).await.unwrap(); let driver = tokio::spawn(conn);
-        let reply = sender.send_request(Request::builder().uri("/padding").header("host", "example.test").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(body(reply).await, "padded"); drop(sender); driver.await.unwrap().unwrap(); server.abort();
-    }).await.unwrap();
+        let tunnel = crate::naive::client::connect_h2(
+            RamaTcpStream::new(TcpStream::connect(address).await.unwrap()),
+            "127.0.0.1:80".parse::<SocketAddr>().unwrap(),
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+            true,
+        )
+        .await
+        .unwrap();
+        let transport = tunnel_transport(tunnel, Duration::from_secs(3));
+        let upstream = Egress {
+            transport,
+            extensions: Extensions::new(),
+            _permit: Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
+        };
+        let (mut sender, conn) = http1::handshake(upstream).await.unwrap();
+        let driver = tokio::spawn(conn);
+        let request = Request::builder()
+            .uri("/padding")
+            .header("host", "example.test")
+            .body(Body::empty())
+            .unwrap();
+        let reply = sender.send_request(request).await.unwrap();
+        assert_eq!(body(reply).await, "padded");
+        drop(sender);
+        driver.await.unwrap().unwrap();
+        server.abort();
+    })
+    .await
+    .unwrap();
 }

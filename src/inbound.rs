@@ -11,9 +11,12 @@ use std::{
 
 use crate::{
     config::Config,
-    naive::client::{Client, Tunnel},
+    naive::{
+        client::{Client, Tunnel},
+        padding::PaddingIo,
+    },
     outbound::connect_outbound,
-    relay::relay,
+    relay::{IdleIo, relay},
     routing::{Action, normalize_domain},
 };
 use anyhow::Result;
@@ -37,10 +40,10 @@ use rama::{
     tcp::TcpStream as RamaTcpStream,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore},
-    task::{AbortHandle, JoinHandle, JoinSet},
+    task::{AbortHandle, JoinSet},
     time::timeout,
 };
 
@@ -54,23 +57,14 @@ struct State {
     permits: Arc<Semaphore>,
 }
 
-// The bounded bridge applies Naive framing once, independently of the inbound protocol.
 pub(crate) enum Transport {
     Direct(TcpStream),
-    Proxy(DuplexStream),
+    Proxy(Box<PaddingIo<IdleIo<Tunnel>>>),
 }
 struct Egress {
     transport: Transport,
     extensions: Extensions,
-    driver: Option<JoinHandle<()>>,
     _permit: OwnedSemaphorePermit,
-}
-impl Drop for Egress {
-    fn drop(&mut self) {
-        if let Some(driver) = &self.driver {
-            driver.abort();
-        }
-    }
 }
 impl ExtensionsRef for Egress {
     fn extensions(&self) -> &Extensions {
@@ -113,19 +107,9 @@ impl AsyncWrite for Egress {
         }
     }
 }
-pub(crate) fn tunnel_transport(
-    tunnel: Tunnel,
-    idle: Duration,
-) -> (Transport, Option<JoinHandle<()>>) {
-    let (local, remote) = tokio::io::duplex(64 * 1024);
-    let driver = tokio::spawn(async move {
-        // Capture the whole tunnel so the relay retains its session and stream permit.
-        let mut tunnel = tunnel;
-        if let Err(error) = relay(remote, &mut tunnel.stream, tunnel.padded, idle).await {
-            tracing::debug!(%error, "Naive bridge ended");
-        }
-    });
-    (Transport::Proxy(local), Some(driver))
+pub(crate) fn tunnel_transport(tunnel: Tunnel, idle: Duration) -> Transport {
+    let padded = tunnel.padded;
+    Transport::Proxy(Box::new(PaddingIo::new(IdleIo::new(tunnel, idle), padded)))
 }
 impl State {
     async fn connect(&self, host: &str, port: u16) -> io::Result<Egress> {
@@ -168,18 +152,17 @@ impl State {
                         .connect(destination)
                         .await
                         .map_err(io::Error::other)?;
-                    let (transport, driver) = tunnel_transport(
+                    let transport = tunnel_transport(
                         tunnel,
                         Duration::from_secs(self.config.idle_timeout_secs),
                     );
                     return Ok(Egress {
                         transport,
-                        driver,
                         extensions: Extensions::new(),
                         _permit: permit,
                     });
                 }
-                let (transport, driver) = match host.parse() {
+                let transport = match host.parse() {
                     Ok(ip) => {
                         self.connect_resolved([SocketAddr::new(ip, port)], domain.as_deref())
                             .await?
@@ -191,7 +174,6 @@ impl State {
                 };
                 Ok(Egress {
                     transport,
-                    driver,
                     extensions: Extensions::new(),
                     _permit: permit,
                 })
@@ -210,7 +192,7 @@ impl State {
         &self,
         addresses: impl IntoIterator<Item = SocketAddr>,
         domain: Option<&str>,
-    ) -> io::Result<(Transport, Option<JoinHandle<()>>)> {
+    ) -> io::Result<Transport> {
         let mut last_error = None;
         for destination in addresses {
             let (action, rule) = self.config.routing.select(destination, domain);
@@ -224,7 +206,7 @@ impl State {
                 }
                 Action::Direct => {
                     match connect_outbound(destination, self.config.outbound_mark).await {
-                        Ok(stream) => return Ok((Transport::Direct(stream), None)),
+                        Ok(stream) => return Ok(Transport::Direct(stream)),
                         Err(error) => last_error = Some(error),
                     }
                 }

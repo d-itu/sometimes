@@ -1144,7 +1144,7 @@ async fn retry_waiting_for_connection_budget_reuses_released_stream() {
 }
 
 #[tokio::test]
-async fn bridge_retains_stream_permit_until_task_finishes() {
+async fn transport_retains_stream_permit_until_dropped() {
     let client = test_pool();
     let (session, server) = pooled_test_session(&client, 64).await;
     let tunnel = session
@@ -1159,15 +1159,12 @@ async fn bridge_retains_stream_permit_until_task_finishes() {
         .unwrap();
     assert_eq!(session.active(), 1);
     let owners = Arc::strong_count(&session);
-    let (transport, driver) = crate::inbound::tunnel_transport(tunnel, Duration::from_secs(60));
+    let transport = crate::inbound::tunnel_transport(tunnel, Duration::from_secs(60));
     assert_eq!(session.active(), 1);
     assert_eq!(Arc::strong_count(&session), owners);
-    let driver = driver.unwrap();
-    driver.abort();
-    assert!(driver.await.unwrap_err().is_cancelled());
+    drop(transport);
     assert_eq!(session.active(), 0);
     assert_eq!(Arc::strong_count(&session), owners - 1);
-    drop(transport);
     drop(session);
     server.await.unwrap();
 }

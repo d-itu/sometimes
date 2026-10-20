@@ -1,24 +1,128 @@
 use std::{
     io,
     pin::Pin,
-    task::{Context, Poll},
+    sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll, ready},
     time::Duration,
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::watch,
-    time::{Instant, sleep_until},
+    io::{AsyncRead, AsyncWrite, ReadBuf, copy_bidirectional},
+    time::{Instant, Sleep, sleep_until},
 };
 
-use crate::naive::padding;
+use crate::naive::padding::PaddingIo;
 
-struct ActiveIo<T> {
+pub(crate) struct IdleIo<T> {
     inner: T,
-    activity: watch::Sender<Instant>,
+    last: Instant,
+    idle: Duration,
+    timer: Pin<Box<Sleep>>,
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for ActiveIo<T> {
+impl<T> IdleIo<T> {
+    pub(crate) fn new(inner: T, idle: Duration) -> Self {
+        let last = Instant::now();
+        Self {
+            inner,
+            last,
+            idle,
+            timer: Box::pin(sleep_until(last + idle)),
+        }
+    }
+
+    fn poll_timeout<R>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<R>> {
+        loop {
+            ready!(self.timer.as_mut().poll(cx));
+            let deadline = self.last + self.idle;
+            if deadline <= Instant::now() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tunnel idle timeout",
+                )));
+            }
+            self.timer.as_mut().reset(deadline);
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for IdleIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Pending => this.poll_timeout(cx),
+            result => {
+                if buf.filled().len() > before {
+                    this.last = Instant::now();
+                }
+                result
+            }
+        }
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for IdleIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Pending => this.poll_timeout(cx),
+            result => {
+                if matches!(result, Poll::Ready(Ok(len)) if len > 0) {
+                    this.last = Instant::now();
+                }
+                result
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Pending => this.poll_timeout(cx),
+            result => result,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Pending => this.poll_timeout(cx),
+            result => result,
+        }
+    }
+}
+
+struct Activity {
+    start: Instant,
+    elapsed: AtomicU64,
+}
+
+impl Activity {
+    fn record(&self) {
+        self.elapsed
+            .store(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn last(&self) -> Instant {
+        self.start + Duration::from_nanos(self.elapsed.load(Ordering::Relaxed))
+    }
+}
+
+struct ActiveIo<'a, T> {
+    inner: T,
+    activity: &'a Activity,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ActiveIo<'_, T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -28,13 +132,13 @@ impl<T: AsyncRead + Unpin> AsyncRead for ActiveIo<T> {
         let before = buf.filled().len();
         let result = Pin::new(&mut this.inner).poll_read(cx, buf);
         if buf.filled().len() > before {
-            this.activity.send_replace(Instant::now());
+            this.activity.record();
         }
         result
     }
 }
 
-impl<T: AsyncWrite + Unpin> AsyncWrite for ActiveIo<T> {
+impl<T: AsyncWrite + Unpin> AsyncWrite for ActiveIo<'_, T> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -43,7 +147,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActiveIo<T> {
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_write(cx, buf);
         if matches!(result, Poll::Ready(Ok(size)) if size > 0) {
-            this.activity.send_replace(Instant::now());
+            this.activity.record();
         }
         result
     }
@@ -56,7 +160,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActiveIo<T> {
 }
 
 pub async fn relay<L, U>(
-    local: L,
+    mut local: L,
     upstream: U,
     padded: bool,
     idle: Duration,
@@ -65,33 +169,29 @@ where
     L: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    let (activity, mut updates) = watch::channel(Instant::now());
+    let activity = Activity {
+        start: Instant::now(),
+        elapsed: AtomicU64::new(0),
+    };
     let upstream = ActiveIo {
         inner: upstream,
-        activity,
+        activity: &activity,
     };
-    let (mut local_read, mut local_write) = tokio::io::split(local);
-    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
-    let transfer = async {
-        tokio::try_join!(
-            padding::encode(&mut local_read, &mut upstream_write, padded),
-            padding::decode(&mut upstream_read, &mut local_write, padded),
-        )
-    };
+    let mut upstream = PaddingIo::new(upstream, padded);
     let watchdog = async {
         loop {
-            let deadline = *updates.borrow_and_update() + idle;
-            tokio::select! {
-                biased;
-                change = updates.changed() => {
-                    if change.is_err() { return Err(io::Error::new(io::ErrorKind::BrokenPipe, "tunnel closed")); }
-                }
-                _ = sleep_until(deadline) => return Err(io::Error::new(io::ErrorKind::TimedOut, "tunnel idle timeout")),
+            let deadline = activity.last() + idle;
+            sleep_until(deadline).await;
+            if activity.last() + idle <= Instant::now() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tunnel idle timeout",
+                ));
             }
         }
     };
     tokio::select! {
-        result = transfer => result,
+        result = copy_bidirectional(&mut local, &mut upstream) => result,
         result = watchdog => result,
     }
 }
@@ -103,23 +203,71 @@ mod tests {
 
     #[tokio::test]
     async fn half_close_still_allows_response() {
+        for padded in [false, true] {
+            let (mut app, local) = tokio::io::duplex(4);
+            let (upstream, server) = tokio::io::duplex(4);
+            let mut server = PaddingIo::new(server, padded);
+            let task = tokio::spawn(relay(local, upstream, padded, Duration::from_secs(2)));
+            let app_task = tokio::spawn(async move {
+                app.write_all(b"request").await.unwrap();
+                app.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                app.read_to_end(&mut response).await.unwrap();
+                response
+            });
+            let mut request = Vec::new();
+            server.read_to_end(&mut request).await.unwrap();
+            assert_eq!(request, b"request");
+            server.write_all(b"response").await.unwrap();
+            server.shutdown().await.unwrap();
+            assert_eq!(app_task.await.unwrap(), b"response");
+            assert_eq!(task.await.unwrap().unwrap(), (7, 8));
+        }
+    }
+
+    #[tokio::test]
+    async fn io_deadline_tracks_activity_in_both_directions() {
+        for writing in [false, true] {
+            let (stream, mut peer) = tokio::io::duplex(4);
+            let mut stream = IdleIo::new(stream, Duration::from_millis(150));
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut byte = [0];
+                if writing {
+                    stream.write_all(b"x").await.unwrap();
+                    peer.read_exact(&mut byte).await.unwrap();
+                } else {
+                    peer.write_all(b"x").await.unwrap();
+                    stream.read_exact(&mut byte).await.unwrap();
+                }
+                assert_eq!(&byte, b"x");
+            }
+            let error = tokio::time::timeout(Duration::from_secs(2), stream.read_u8())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_deadline_tracks_activity_and_expires_after_half_close() {
         let (mut app, local) = tokio::io::duplex(4);
-        let (upstream, mut server) = tokio::io::duplex(4);
-        let task = tokio::spawn(relay(local, upstream, false, Duration::from_secs(2)));
-        let app_task = tokio::spawn(async move {
-            app.write_all(b"request").await.unwrap();
-            app.shutdown().await.unwrap();
-            let mut response = Vec::new();
-            app.read_to_end(&mut response).await.unwrap();
-            response
-        });
-        let mut request = Vec::new();
-        server.read_to_end(&mut request).await.unwrap();
-        assert_eq!(request, b"request");
-        server.write_all(b"response").await.unwrap();
-        server.shutdown().await.unwrap();
-        assert_eq!(app_task.await.unwrap(), b"response");
-        assert_eq!(task.await.unwrap().unwrap(), (7, 8));
+        let (upstream, mut peer) = tokio::io::duplex(4);
+        let task = tokio::spawn(relay(local, upstream, false, Duration::from_millis(150)));
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            app.write_all(b"x").await.unwrap();
+            assert_eq!(peer.read_u8().await.unwrap(), b'x');
+        }
+        app.shutdown().await.unwrap();
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]

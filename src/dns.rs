@@ -17,9 +17,8 @@ use tokio::{
 };
 
 use crate::{
-    naive::client::Client,
+    naive::{client::Client, padding::PaddingIo},
     outbound::connect_outbound,
-    relay::relay,
     routing::{Action as RouteAction, Routing, normalize_domain},
 };
 
@@ -528,18 +527,10 @@ impl Context {
         address: impl Into<Authority>,
     ) -> Result<Vec<u8>> {
         timeout(Duration::from_millis(self.config.timeout_ms), async {
-            let mut tunnel = self.client.connect(address).await?;
-            let (mut local, remote) = tokio::io::duplex(64 * 1024);
-            let query = query_tcp_stream(&mut local, request, self.config.max_packet_bytes);
-            tokio::pin!(query);
-            tokio::select! {
-                biased;
-                result = &mut query => result,
-                result = relay(remote, &mut tunnel.stream, tunnel.padded, Duration::from_millis(self.config.timeout_ms)) => {
-                    result?;
-                    query.await
-                }
-            }
+            let tunnel = self.client.connect(address).await?;
+            let padded = tunnel.padded;
+            let mut stream = PaddingIo::new(tunnel, padded);
+            query_tcp_stream(&mut stream, request, self.config.max_packet_bytes).await
         })
         .await?
     }
@@ -582,6 +573,7 @@ async fn query_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<Vec<u8>> {
     stream.write_u16(request.len() as u16).await?;
     stream.write_all(request).await?;
+    stream.flush().await?;
     let size = stream.read_u16().await? as usize;
     ensure!(size <= max_packet_bytes, "DNS response is too large");
     let mut response = vec![0; size];
