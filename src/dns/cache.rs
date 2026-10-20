@@ -1,6 +1,6 @@
 use std::{
     num::NonZeroUsize,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -10,10 +10,6 @@ use lru::LruCache;
 
 use super::packet::{cache_ttls, with_id};
 
-#[derive(Hash, PartialEq, Eq)]
-struct Key(Vec<u8>);
-
-#[derive(Clone)]
 struct Entry {
     packet: Vec<u8>,
     cached_at: Instant,
@@ -21,7 +17,7 @@ struct Entry {
     ttl_offsets: Vec<usize>,
 }
 
-pub(super) struct ResponseCache(Mutex<LruCache<Key, Entry, AHashState>>);
+pub(super) struct ResponseCache(Mutex<LruCache<Vec<u8>, Arc<Entry>, AHashState>>);
 
 impl ResponseCache {
     pub(super) fn new(size: NonZeroUsize) -> Self {
@@ -37,7 +33,7 @@ impl ResponseCache {
             .0
             .lock()
             .unwrap()
-            .get(&Key(request[2..].to_vec()))
+            .get(&request[2..])
             .filter(|entry| entry.expires > now)
             .cloned()?;
         let mut response = with_id(&entry.packet, request);
@@ -58,15 +54,14 @@ impl ResponseCache {
     pub(super) fn insert(&self, request: &[u8], response: &[u8]) {
         if let Some((ttl, ttl_offsets)) = cache_ttls(response) {
             let cached_at = Instant::now();
-            self.0.lock().unwrap().put(
-                Key(request[2..].to_vec()),
-                Entry {
-                    packet: response.to_vec(),
-                    cached_at,
-                    expires: cached_at + Duration::from_secs(ttl.into()),
-                    ttl_offsets,
-                },
-            );
+            let key = request[2..].to_vec();
+            let entry = Arc::new(Entry {
+                packet: response.to_vec(),
+                cached_at,
+                expires: cached_at + Duration::from_secs(ttl.into()),
+                ttl_offsets,
+            });
+            self.0.lock().unwrap().put(key, entry);
         }
     }
 }
@@ -89,11 +84,7 @@ mod tests {
         response.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0x80, 0, 0, 0, 0]);
         let cache = ResponseCache::new(NonZeroUsize::new(2).unwrap());
         cache.insert(&request, &response);
-        cache
-            .0
-            .lock()
-            .unwrap()
-            .get_mut(&Key(request[2..].to_vec()))
+        Arc::get_mut(cache.0.lock().unwrap().get_mut(&request[2..]).unwrap())
             .unwrap()
             .cached_at -= Duration::from_secs(2);
         let mut other = request.clone();

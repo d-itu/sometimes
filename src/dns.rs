@@ -205,34 +205,57 @@ impl Config {
         );
         Ok(())
     }
+}
 
-    fn target<'a>(&'a self, name: &str) -> Result<Option<&'a Upstream>> {
-        let rule = self.routing.rules.iter().find(|rule| {
-            rule.domain
+struct PreparedRouting {
+    rules: Vec<PreparedRule>,
+    default: usize,
+}
+
+struct PreparedRule {
+    domain: Vec<String>,
+    domain_suffix: Vec<String>,
+    upstream: Option<usize>,
+}
+
+impl PreparedRouting {
+    fn new(config: &Config) -> Self {
+        let index = |name: &str| {
+            config
+                .upstreams
                 .iter()
-                .any(|item| normalize_domain(item).as_deref() == Some(name))
+                .position(|upstream| upstream.name == name)
+                .expect("validated DNS upstream name")
+        };
+        let domains = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| normalize_domain(name).expect("validated DNS routing domain"))
+                .collect()
+        };
+        Self {
+            default: index(&config.routing.default),
+            rules: config
+                .routing
+                .rules
+                .iter()
+                .map(|rule| PreparedRule {
+                    domain: domains(&rule.domain),
+                    domain_suffix: domains(&rule.domain_suffix),
+                    upstream: rule.upstream.as_deref().map(index),
+                })
+                .collect(),
+        }
+    }
+
+    fn target(&self, name: &str) -> Option<usize> {
+        let rule = self.rules.iter().find(|rule| {
+            rule.domain.iter().any(|item| item == name)
                 || rule.domain_suffix.iter().any(|item| {
-                    normalize_domain(item).is_some_and(|suffix| {
-                        name == suffix
-                            || name.strip_suffix(&suffix).is_some_and(|p| p.ends_with('.'))
-                    })
+                    name == item || name.strip_suffix(item).is_some_and(|p| p.ends_with('.'))
                 })
         });
-        match rule {
-            Some(rule) if rule.action.is_some() => Ok(None),
-            Some(rule) => self
-                .upstreams
-                .iter()
-                .find(|u| Some(&u.name) == rule.upstream.as_ref())
-                .map(Some)
-                .context("DNS rule references unknown upstream"),
-            None => self
-                .upstreams
-                .iter()
-                .find(|u| u.name == self.routing.default)
-                .map(Some)
-                .context("DNS default upstream does not exist"),
-        }
+        rule.map_or(Some(self.default), |rule| rule.upstream)
     }
 }
 
@@ -241,6 +264,7 @@ type Cache = Arc<ResponseCache>;
 #[derive(Clone)]
 struct Context {
     config: Arc<Config>,
+    dns_routing: Arc<PreparedRouting>,
     cache: Cache,
     routing: Arc<Routing>,
     client: Arc<Client>,
@@ -275,6 +299,7 @@ impl Context {
         mark: Option<u32>,
     ) -> Self {
         Self {
+            dns_routing: Arc::new(PreparedRouting::new(&config)),
             config,
             cache,
             routing: Arc::new(routing),
@@ -383,9 +408,10 @@ impl Context {
         if let Some(response) = self.cache.get(request) {
             return response;
         }
-        let Some(upstream) = self.config.target(&name)? else {
+        let Some(index) = self.dns_routing.target(&name) else {
             return error_response(request, 5);
         };
+        let upstream = &self.config.upstreams[index];
         let response = match self.query_upstream(request, upstream).await {
             Ok(response) => response,
             Err(error) => {
@@ -429,9 +455,7 @@ impl Context {
             .await?;
         let mut last_error = None;
         for address in addresses {
-            let (action, rule) = self
-                .routing
-                .select(address, normalize_domain(&upstream.host).as_deref());
+            let (action, rule) = self.routing.select(address, domain.as_deref());
             tracing::info!(
                 upstream = %upstream.name,
                 host = %upstream.host,
@@ -765,6 +789,40 @@ mod tests {
     }
 
     #[test]
+    fn prepared_routing_preserves_normalization_order_and_suffix_boundaries() {
+        let config: Config = toml::from_str(
+            r#"
+            [routing]
+            default = 'direct'
+            [[routing.rules]]
+            domain = ['Allowed.Example.COM.']
+            upstream = 'other'
+            [[routing.rules]]
+            domain_suffix = ['Example.COM.']
+            action = 'reject'
+            [[upstreams]]
+            name = 'other'
+            host = '127.0.0.2'
+            port = 53
+            protocol = 'udp'
+            [[upstreams]]
+            name = 'direct'
+            host = '127.0.0.1'
+            port = 53
+            protocol = 'udp'
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let routing = PreparedRouting::new(&config);
+        assert_eq!(routing.target("allowed.example.com"), Some(0));
+        assert_eq!(routing.target("example.com"), None);
+        assert_eq!(routing.target("www.example.com"), None);
+        assert_eq!(routing.target("notexample.com"), Some(1));
+        assert_eq!(routing.target("other.test"), Some(1));
+    }
+
+    #[test]
     fn extracts_and_routes_names() {
         let mut packet = vec![0; 12];
         packet.extend_from_slice(&[7]);
@@ -774,6 +832,10 @@ mod tests {
         packet.extend_from_slice(&[0, 0, 1, 0, 1]);
         let config: Config = toml::from_str("[routing]\ndefault = 'direct'\n[[routing.rules]]\ndomain_suffix = ['example.com']\naction = 'reject'\n[[upstreams]]\nname='direct'\nhost='127.0.0.1'\nport=53\nprotocol='udp'").unwrap();
         assert_eq!(packet::query_name(&packet).as_deref(), Some("example.com"));
-        assert!(config.target("www.example.com").unwrap().is_none());
+        assert!(
+            PreparedRouting::new(&config)
+                .target("www.example.com")
+                .is_none()
+        );
     }
 }
