@@ -3,6 +3,10 @@ use rama::tls::rustls::dep::rustls::{ClientConfig, ClientConnection, RootCertSto
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
+fn probe(bytes: &[u8]) -> Probe {
+    super::probe(bytes, &mut TlsProbe::default())
+}
+
 fn client_hello() -> Vec<u8> {
     let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()
@@ -29,10 +33,11 @@ fn tls_client_hello_across_every_record_boundary() {
     let size = usize::from(u16::from_be_bytes([hello[3], hello[4]]));
     let handshake = &hello[5..5 + size];
     for split in 1..handshake.len() {
+        let mut probe = TlsProbe::default();
         let mut wire = record(&handshake[..split]);
-        assert!(matches!(probe(&wire), Probe::More));
+        assert!(matches!(probe.probe(&wire), Probe::More));
         wire.extend_from_slice(&record(&handshake[split..]));
-        assert!(matches!(probe(&wire), Probe::Done(Some(name)) if name == "example.com"));
+        assert!(matches!(probe.probe(&wire), Probe::Done(Some(name)) if name == "example.com"));
     }
     for split in 0..5 + size {
         assert!(matches!(probe(&hello[..split]), Probe::More));
@@ -56,6 +61,29 @@ fn http_host_and_malformed_inputs() {
     ] {
         assert!(matches!(probe(bytes), Probe::Done(None)));
     }
+}
+
+#[tokio::test]
+async fn fragmented_tls_records_replay_exactly() {
+    let hello = client_hello();
+    let size = usize::from(u16::from_be_bytes([hello[3], hello[4]]));
+    let wire: Vec<_> = hello[5..5 + size].chunks(1).flat_map(record).collect();
+    let expected = wire.clone();
+    let (mut app, socket) = tokio::io::duplex(2);
+    let sender = tokio::spawn(async move {
+        app.write_all(&wire).await.unwrap();
+        app.shutdown().await.unwrap();
+    });
+    let config = Sniff {
+        timeout_ms: 2000,
+        ..Sniff::default()
+    };
+    let (mut stream, name) = inspect(socket, &config).await.unwrap();
+    assert_eq!(name.as_deref(), Some("example.com"));
+    let mut received = Vec::new();
+    stream.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, expected);
+    sender.await.unwrap();
 }
 
 #[tokio::test]

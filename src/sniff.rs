@@ -54,12 +54,12 @@ enum Probe {
     Done(Option<String>),
 }
 
-fn probe(bytes: &[u8]) -> Probe {
+fn probe(bytes: &[u8], tls: &mut TlsProbe) -> Probe {
     if bytes.is_empty() {
         return Probe::More;
     }
     if bytes[0] == 22 {
-        return tls(bytes);
+        return tls.probe(bytes);
     }
     // Stop early on protocols that cannot start an HTTP/1 request.
     if !bytes[0].is_ascii_uppercase() {
@@ -79,8 +79,11 @@ fn probe(bytes: &[u8]) -> Probe {
     };
     let mut lines = header.split("\r\n");
     let request = lines.next().unwrap_or_default();
-    let parts: Vec<_> = request.split(' ').collect();
-    if parts.len() != 3 || !matches!(parts[2], "HTTP/1.0" | "HTTP/1.1") {
+    let mut parts = request.split(' ');
+    if !matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(_), Some(_), Some("HTTP/1.0" | "HTTP/1.1"), None)
+    ) {
         return Probe::Done(None);
     }
     let mut host = None;
@@ -107,43 +110,71 @@ fn probe(bytes: &[u8]) -> Probe {
     Probe::Done(host)
 }
 
-fn tls(bytes: &[u8]) -> Probe {
-    let mut rest = bytes;
-    let mut handshake = Vec::new();
-    loop {
-        if rest.len() < 5 {
-            return Probe::More;
-        }
-        if rest[0] != 22 || rest[1] != 3 || rest[2] > 4 {
-            return Probe::Done(None);
-        }
-        let size = usize::from(u16::from_be_bytes([rest[3], rest[4]]));
-        if size == 0 || size > 16384 {
-            return Probe::Done(None);
-        }
-        if rest.len() < 5 + size {
-            return Probe::More;
-        }
-        handshake.extend_from_slice(&rest[5..5 + size]);
-        rest = &rest[5 + size..];
-        if handshake.len() >= 4 {
-            if handshake[0] != 1 {
+/// Resumes at the next record in a growing prefix, buffering only fragmented handshakes.
+#[derive(Default)]
+struct TlsProbe {
+    offset: usize,
+    handshake: Vec<u8>,
+}
+
+impl TlsProbe {
+    fn probe(&mut self, bytes: &[u8]) -> Probe {
+        loop {
+            let rest = &bytes[self.offset..];
+            if rest.len() < 5 {
+                return Probe::More;
+            }
+            if rest[0] != 22 || rest[1] != 3 || rest[2] > 4 {
                 return Probe::Done(None);
             }
-            let size = (usize::from(handshake[1]) << 16)
-                | (usize::from(handshake[2]) << 8)
-                | usize::from(handshake[3]);
-            if handshake.len() >= 4 + size {
-                return Probe::Done(parse_client_hello(&handshake[4..4 + size]).ok().and_then(
-                    |hello| {
-                        hello
-                            .ext_server_name()
-                            .and_then(|name| normalize_domain(name.as_str()))
-                    },
-                ));
+            let size = usize::from(u16::from_be_bytes([rest[3], rest[4]]));
+            if size == 0 || size > 16384 {
+                return Probe::Done(None);
+            }
+            if rest.len() < 5 + size {
+                return Probe::More;
+            }
+            self.offset += 5 + size;
+            let payload = &rest[5..5 + size];
+            let handshake = if self.handshake.is_empty() {
+                payload
+            } else {
+                self.handshake.extend_from_slice(payload);
+                &self.handshake
+            };
+            match hello(handshake) {
+                Probe::More => {}
+                done => return done,
+            }
+            if self.handshake.is_empty() {
+                self.handshake.extend_from_slice(payload);
             }
         }
     }
+}
+
+fn hello(handshake: &[u8]) -> Probe {
+    if handshake.len() < 4 {
+        return Probe::More;
+    }
+    if handshake[0] != 1 {
+        return Probe::Done(None);
+    }
+    let size = (usize::from(handshake[1]) << 16)
+        | (usize::from(handshake[2]) << 8)
+        | usize::from(handshake[3]);
+    if handshake.len() < 4 + size {
+        return Probe::More;
+    }
+    Probe::Done(
+        parse_client_hello(&handshake[4..4 + size])
+            .ok()
+            .and_then(|hello| {
+                hello
+                    .ext_server_name()
+                    .and_then(|name| normalize_domain(name.as_str()))
+            }),
+    )
 }
 
 pub async fn inspect<S: AsyncRead + Unpin>(
@@ -151,10 +182,11 @@ pub async fn inspect<S: AsyncRead + Unpin>(
     config: &Sniff,
 ) -> io::Result<(Replay<S>, Option<String>)> {
     let mut prefix = Vec::new();
+    let mut tls = TlsProbe::default();
     let domain = if config.enabled {
         timeout(Duration::from_millis(config.timeout_ms), async {
             loop {
-                match probe(&prefix) {
+                match probe(&prefix, &mut tls) {
                     Probe::Done(domain) => return Ok::<_, io::Error>(domain),
                     Probe::More => {}
                 }
