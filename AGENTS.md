@@ -2,4 +2,6 @@
 
 This project does not use a root `README.md`. Project documentation is organized by topic under `docs/`.
 
-Keep documentation changes in the appropriate `docs/*.md` file. Do not create or restore a root README. Update cross-references when moving or renaming documentation.
+Documentation must not describe implementation details. Rust documentation comments may be used for documentation.
+Do not modify documentation in regular commits. Keep documentation changes in dedicated documentation commits.
+Keep every line at most 130 columns wide.

@@ -1,5 +1,8 @@
 # Development
 
+For application setup and configuration validation, follow [quick start](overview.md#quick-start).
+Run the commands below from the repository root.
+
 ## Build and check
 
 Use Rust 1.96 or newer with Cargo, rustfmt, and Clippy. TOML checks require `tombi`.
@@ -13,19 +16,15 @@ tombi lint Cargo.toml examples/sometimes.toml
 tombi format --check Cargo.toml examples/sometimes.toml
 ```
 
+Ordinary tests cover padding, TLS/H2, routing, DNS, and explicit proxy inbounds.
+
+## Network tests
+
 The network tests additionally require user/network namespaces, `ip`, `nft`, and kernel TPROXY support:
 
 ```sh
 bash scripts/test-netns.sh
 ```
 
-The script compiles first and runs the ignored TPROXY tests in an isolated namespace without changing host networking. Ordinary tests cover padding, TLS/H2, routing, DNS, and explicit proxy inbounds.
-
-## Configuration check
-
-```sh
-cargo run -- check --config examples/sometimes.toml
-cargo build --release
-```
-
-The `check` command validates configuration and TLS client setup without opening network sockets. The example contains a placeholder hostname; a successful check does not imply that the upstream exists or that credentials are accepted.
+The script runs the TPROXY tests in an isolated namespace without changing host networking.
+Use this script instead of changing host networking for tests.
