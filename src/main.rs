@@ -37,15 +37,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Run { config } => {
-            let mut config = Config::load(&config)?;
+            let config = Config::load(&config)?;
             fmt()
                 .with_env_filter(
                     EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| EnvFilter::new(config.log.level.as_str())),
                 )
                 .init();
-            config.validate()?;
-            config.routing.prepare()?;
             sometimes::linux::run(Arc::new(config)).await
         }
     }
