@@ -508,7 +508,7 @@ impl<'a> ConnectRequest<'a> {
                         .resolve_host(&self.client.upstream.host, self.client.upstream.port);
                     match self.while_connecting(resolving).await {
                         ConnectionProgress::Ready(Ok(addresses)) => {
-                            return self.addresses(addresses, slot).await;
+                            return self.addresses(addresses.iter().copied(), slot).await;
                         }
                         ConnectionProgress::Ready(Err(error)) => {
                             drop(slot);

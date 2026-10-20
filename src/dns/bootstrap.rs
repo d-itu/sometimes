@@ -17,7 +17,7 @@ pub(super) type BootstrapCache =
     LruCache<(String, u16), Arc<AsyncMutex<Option<BootstrapEntry>>>, AHashState>;
 
 pub(super) struct BootstrapEntry {
-    addresses: Vec<SocketAddr>,
+    addresses: Arc<[SocketAddr]>,
     expires: Instant,
 }
 
@@ -44,9 +44,9 @@ impl Resolver {
         })
     }
 
-    pub(crate) async fn resolve_host(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    pub(crate) async fn resolve_host(&self, host: &str, port: u16) -> Result<Arc<[SocketAddr]>> {
         if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(ip, port)]);
+            return Ok(Arc::from([SocketAddr::new(ip, port)]));
         }
         let name = crate::routing::normalize_domain(host).expect("validated DNS upstream host");
         let key = (name.clone(), port);
@@ -90,6 +90,7 @@ impl Resolver {
             !result.is_empty(),
             "bootstrap resolver returned no address for DNS upstream"
         );
+        let result: Arc<[SocketAddr]> = result.into();
         *cached = (ttl > 0).then(|| BootstrapEntry {
             addresses: result.clone(),
             expires: Instant::now() + Duration::from_secs(ttl.into()),

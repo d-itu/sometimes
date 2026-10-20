@@ -453,7 +453,7 @@ impl Context {
             .resolve_host(&upstream.host, upstream.port)
             .await?;
         let mut last_error = None;
-        for address in addresses {
+        for &address in addresses.iter() {
             let (action, rule) = self.routing.select(address, domain.as_deref());
             tracing::info!(
                 upstream = %upstream.name,
