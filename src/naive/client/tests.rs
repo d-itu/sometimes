@@ -1215,6 +1215,7 @@ async fn dns_failure_with_pooled_session(available: bool) {
     timeout(Duration::from_secs(5), async {
         let mut client = test_pool();
         client.upstream.host = "proxy.test".into();
+        client.target = Target::new(&client.upstream.host, client.upstream.port);
         let dns_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.resolver = Resolver::from_config(
             &dns::Config {
@@ -1425,6 +1426,7 @@ async fn warm_pool_replacement(full_pool: bool) {
         });
         let mut client = test_pool();
         client.upstream.port = address.port();
+        client.target = Target::new(&client.upstream.host, client.upstream.port);
         client.server_name = ServerName::try_from("proxy.test").unwrap();
         client.tls = tls;
         let (rejected, rejected_server) = pooled_test_session_with_status(&client, 1, 503).await;
@@ -1570,6 +1572,7 @@ async fn stalled_establishment(settings: bool, cancel: bool, reject_reuse: bool)
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = test_pool();
         client.upstream.port = listener.local_addr().unwrap().port();
+        client.target = Target::new(&client.upstream.host, client.upstream.port);
         client.server_name = ServerName::try_from("proxy.test").unwrap();
         client.tls = tls;
         let (session, pooled_server) = pooled_test_session_with_status(

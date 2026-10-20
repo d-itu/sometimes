@@ -46,12 +46,16 @@ use tokio::{
 
 use crate::{
     config::Upstream,
-    dns::{self, bootstrap::Resolver},
+    dns::{
+        self,
+        bootstrap::{Resolver, Target},
+    },
     outbound::connect_outbound,
 };
 
 pub struct Client {
     upstream: Upstream,
+    target: Target,
     outbound_mark: Option<u32>,
     tls: TlsConnector,
     authorization: HeaderValue,
@@ -273,6 +277,7 @@ impl Client {
         let mut authorization = HeaderValue::from_str(&format!("Basic {encoded}"))?;
         authorization.set_sensitive(true);
         Ok(Self {
+            target: Target::new(&upstream.host, upstream.port),
             upstream,
             outbound_mark,
             tls: TlsConnector::from(Arc::new(tls)),
@@ -502,10 +507,7 @@ impl<'a> ConnectRequest<'a> {
             let (session, permit) = match self.assign(allocation).await {
                 Assignment::Stream(session, permit) => (session, permit),
                 Assignment::Connection(slot) => {
-                    let resolving = self
-                        .client
-                        .resolver
-                        .resolve_host(&self.client.upstream.host, self.client.upstream.port);
+                    let resolving = self.client.resolver.resolve_host(&self.client.target);
                     match self.while_connecting(resolving).await {
                         ConnectionProgress::Ready(Ok(addresses)) => {
                             return self.addresses(addresses.iter().copied(), slot).await;

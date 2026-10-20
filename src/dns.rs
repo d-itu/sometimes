@@ -26,9 +26,9 @@ pub mod bootstrap;
 mod cache;
 mod packet;
 
-use bootstrap::Resolver;
+use bootstrap::{Resolver, Target};
 use cache::ResponseCache;
-use packet::{error_response, query, validate_response, with_id};
+use packet::{error_response, query, validate_response};
 
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -258,12 +258,38 @@ impl PreparedRouting {
     }
 }
 
+struct PreparedUpstream {
+    config: Upstream,
+    target: Target,
+    proxy_target: Option<HostWithPort>,
+}
+
+impl PreparedUpstream {
+    fn new(config: &Upstream) -> Self {
+        let target = Target::new(&config.host, config.port);
+        let proxy_target = target.domain().map(|name| {
+            HostWithPort::new(
+                Domain::try_from(name)
+                    .expect("validated DNS upstream domain")
+                    .into(),
+                config.port,
+            )
+        });
+        Self {
+            config: config.clone(),
+            target,
+            proxy_target,
+        }
+    }
+}
+
 type Cache = Arc<ResponseCache>;
 
 #[derive(Clone)]
 struct Context {
     config: Arc<Config>,
     dns_routing: Arc<PreparedRouting>,
+    upstreams: Arc<[PreparedUpstream]>,
     cache: Cache,
     routing: Arc<Routing>,
     client: Arc<Client>,
@@ -299,6 +325,7 @@ impl Context {
     ) -> Self {
         Self {
             dns_routing: Arc::new(PreparedRouting::new(&config)),
+            upstreams: config.upstreams.iter().map(PreparedUpstream::new).collect(),
             config,
             cache,
             routing: Arc::new(routing),
@@ -381,13 +408,14 @@ impl Context {
 
     async fn handle_tcp(self, mut stream: TcpStream) -> Result<()> {
         let idle = Duration::from_secs(self.config.tcp_idle_timeout_secs);
+        let mut request = Vec::new();
         loop {
             let size = timeout(idle, stream.read_u16()).await?? as usize;
             ensure!(
                 size <= self.config.max_packet_bytes,
                 "DNS TCP packet is too large"
             );
-            let mut request = vec![0; size];
+            request.resize(size, 0);
             timeout(idle, stream.read_exact(&mut request)).await??;
             let response = self.handle(&request).await?;
             ensure!(
@@ -410,19 +438,19 @@ impl Context {
         let Some(index) = self.dns_routing.target(&name) else {
             return error_response(request, 5);
         };
-        let upstream = &self.config.upstreams[index];
+        let upstream = &self.upstreams[index];
         let response = match self.query_upstream(request, upstream).await {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(upstream = %upstream.name, %error, "DNS upstream query failed");
+                tracing::warn!(upstream = %upstream.config.name, %error, "DNS upstream query failed");
                 error_response(request, 2)?
             }
         };
         self.cache.insert(request, &response);
-        with_id(&response, request)
+        Ok(response)
     }
 
-    async fn query_upstream(&self, request: &[u8], upstream: &Upstream) -> Result<Vec<u8>> {
+    async fn query_upstream(&self, request: &[u8], upstream: &PreparedUpstream) -> Result<Vec<u8>> {
         timeout(
             Duration::from_millis(self.config.timeout_ms),
             self.query_upstream_inner(request, upstream),
@@ -430,31 +458,28 @@ impl Context {
         .await?
     }
 
-    async fn query_upstream_inner(&self, request: &[u8], upstream: &Upstream) -> Result<Vec<u8>> {
-        let domain = normalize_domain(&upstream.host);
-        if let Some(name) = domain.as_deref()
+    async fn query_upstream_inner(
+        &self,
+        request: &[u8],
+        prepared: &PreparedUpstream,
+    ) -> Result<Vec<u8>> {
+        let upstream = &prepared.config;
+        let domain = prepared.target.domain();
+        if let Some(name) = domain
             && self.routing.select_before_dns(name, upstream.port) == Some(RouteAction::Proxy)
         {
             ensure!(
                 upstream.protocol != Protocol::Udp,
                 "UDP DNS cannot use NaiveProxy"
             );
-            let target = HostWithPort::new(
-                Domain::try_from(name)
-                    .expect("validated DNS upstream domain")
-                    .into(),
-                upstream.port,
-            );
+            let target = prepared.proxy_target.as_ref().unwrap().clone();
             tracing::info!(upstream = %upstream.name, %target, "DNS upstream routed through proxy");
             return self.query_tcp_proxy(request, target).await;
         }
-        let addresses = self
-            .resolver
-            .resolve_host(&upstream.host, upstream.port)
-            .await?;
+        let addresses = self.resolver.resolve_host(&prepared.target).await?;
         let mut last_error = None;
         for &address in addresses.iter() {
-            let (action, rule) = self.routing.select(address, domain.as_deref());
+            let (action, rule) = self.routing.select(address, domain);
             tracing::info!(
                 upstream = %upstream.name,
                 host = %upstream.host,
@@ -585,6 +610,82 @@ async fn query_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tcp_queries_preserve_ids_across_sizes_and_cache_hits() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            for _ in 0..2 {
+                let (size, peer) = upstream.recv_from(&mut buffer).await.unwrap();
+                let mut response = buffer[..size].to_vec();
+                response[2] |= 0x80;
+                response[6..8].copy_from_slice(&1u16.to_be_bytes());
+                response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+                response.extend_from_slice(&60u32.to_be_bytes());
+                response.extend_from_slice(&[0, 4, 127, 0, 0, 1]);
+                upstream.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let config = Arc::new(Config {
+            upstreams: vec![Upstream {
+                port: upstream_address.port(),
+                ..Upstream::default()
+            }],
+            ..Config::default()
+        });
+        let context = Context::new(
+            config.clone(),
+            Arc::new(ResponseCache::new(NonZeroUsize::new(2).unwrap())),
+            Routing {
+                default: RouteAction::Direct,
+                ..Routing::default()
+            },
+            Arc::new(
+                Client::new(
+                    crate::config::Upstream {
+                        host: "127.0.0.1".into(),
+                        port: 443,
+                        server_name: None,
+                        username: "user".into(),
+                        password: "pass".into(),
+                        require_padding: true,
+                    },
+                    None,
+                )
+                .unwrap(),
+            ),
+            Resolver::from_config(&config, None),
+            None,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let connection = tokio::spawn(context.handle_tcp(stream));
+        for (id, name) in [(1u16, "a.test"), (2, "longer.example.test"), (3, "a.test")] {
+            let mut request = packet::make_query(name, 1);
+            request[..2].copy_from_slice(&id.to_be_bytes());
+            let response = timeout(
+                Duration::from_secs(2),
+                query_tcp_stream(&mut client, &request, 512),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&response[..2], &id.to_be_bytes());
+            assert_eq!(
+                packet::answer_ips(&response),
+                vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+            );
+        }
+        server.await.unwrap();
+        client.shutdown().await.unwrap();
+        assert!(connection.await.unwrap().is_err());
+    }
+
     #[test]
     fn rejects_invalid_dns_upstream_references() {
         let mut config = Config::default();
@@ -664,7 +765,7 @@ mod tests {
         let request = packet::make_query("example.com", 1);
         let result = timeout(
             Duration::from_millis(150),
-            context.query_upstream(&request, &upstream),
+            context.query_upstream(&request, &PreparedUpstream::new(&upstream)),
         )
         .await
         .expect("all addresses must share the configured deadline");
@@ -739,7 +840,7 @@ mod tests {
             None,
         );
         let error = context
-            .query_upstream(&request, &upstream)
+            .query_upstream(&request, &PreparedUpstream::new(&upstream))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("UDP DNS cannot use NaiveProxy"));
@@ -773,7 +874,12 @@ mod tests {
             resolver,
             None,
         );
-        assert!(context.query_upstream(&request, &upstream).await.is_err());
+        assert!(
+            context
+                .query_upstream(&request, &PreparedUpstream::new(&upstream))
+                .await
+                .is_err()
+        );
         timeout(Duration::from_secs(3), accepted)
             .await
             .unwrap()
@@ -822,7 +928,12 @@ mod tests {
         packet.extend_from_slice(&[3]);
         packet.extend_from_slice(b"com");
         packet.extend_from_slice(&[0, 0, 1, 0, 1]);
-        let config: Config = toml::from_str("[routing]\ndefault = 'direct'\n[[routing.rules]]\ndomain_suffix = ['example.com']\naction = 'reject'\n[[upstreams]]\nname='direct'\nhost='127.0.0.1'\nport=53\nprotocol='udp'").unwrap();
+        let config: Config = toml::from_str(concat!(
+            "[routing]\ndefault = 'direct'\n",
+            "[[routing.rules]]\ndomain_suffix = ['example.com']\naction = 'reject'\n",
+            "[[upstreams]]\nname='direct'\nhost='127.0.0.1'\nport=53\nprotocol='udp'"
+        ))
+        .unwrap();
         assert_eq!(packet::query_name(&packet).as_deref(), Some("example.com"));
         assert!(
             PreparedRouting::new(&config)
