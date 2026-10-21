@@ -11,7 +11,7 @@ use lru::LruCache;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::packet::{answer_ips, cache_ttls, make_query};
-use super::{Config, query_udp};
+use super::{Config, upstream::query_udp};
 
 pub(super) type BootstrapCache =
     LruCache<(Arc<str>, u16), Arc<AsyncMutex<Option<BootstrapEntry>>>, AHashState>;
@@ -98,8 +98,13 @@ impl Resolver {
             for &server in &self.servers {
                 let request = make_query(name, qtype);
                 queries.spawn(async move {
-                    let response =
-                        query_udp(&request, server, timeout, max_packet_bytes, mark).await;
+                    let response = tokio::time::timeout(
+                        timeout,
+                        query_udp(&request, server, max_packet_bytes, mark),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|response| response);
                     (response, Instant::now())
                 });
             }
@@ -140,6 +145,27 @@ impl Resolver {
 mod tests {
     use super::*;
     use tokio::{net::UdpSocket, time::sleep};
+
+    #[tokio::test]
+    async fn unresponsive_bootstrap_queries_expire() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = Config {
+            bootstrap: vec![server.local_addr().unwrap()],
+            timeout_ms: 30,
+            ..Config::default()
+        };
+        let resolver = Resolver::from_config(&config, None);
+        let target = Target::new("dns.example", 53);
+        let error = tokio::time::timeout(Duration::from_secs(2), resolver.resolve_host(&target))
+            .await
+            .expect("bootstrap queries must enforce their own deadline")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("bootstrap resolver returned no address")
+        );
+    }
 
     fn answer(request: &[u8], addresses: &[[u8; 4]], ttl: u32) -> Vec<u8> {
         let mut response = request.to_vec();
