@@ -58,13 +58,13 @@ tcp_idle_timeout_secs = 30
 
 [[dns.upstreams]]
 name = "direct"
-protocol = "tcp+udp"
+protocol = "udp"
 host = "1.1.1.1"
 port = 53
 
 [[dns.upstreams]]
 name = "backup"
-protocol = "tcp+udp"
+protocol = "udp"
 host = "8.8.8.8"
 port = 53
 

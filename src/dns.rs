@@ -90,8 +90,6 @@ pub enum Protocol {
     Udp,
     #[serde(rename = "tcp")]
     Tcp,
-    #[serde(rename = "tcp+udp")]
-    TcpUdp,
 }
 
 #[derive(Clone, Deserialize)]
@@ -504,26 +502,10 @@ impl Context {
                         .await
                     }
                     Protocol::Tcp => self.query_tcp(request, address).await,
-                    Protocol::TcpUdp => match query_udp(
-                        request,
-                        address,
-                        Duration::from_millis(self.config.timeout_ms),
-                        self.config.max_packet_bytes,
-                        self.mark,
-                    )
-                    .await
-                    {
-                        Ok(response) if !response.get(2).is_some_and(|v| v & 2 != 0) => {
-                            Ok(response)
-                        }
-                        _ => self.query_tcp(request, address).await,
-                    },
                 },
                 RouteAction::Proxy => match upstream.protocol {
                     Protocol::Udp => Err(anyhow::anyhow!("UDP DNS cannot use NaiveProxy")),
-                    Protocol::Tcp | Protocol::TcpUdp => {
-                        self.query_tcp_proxy(request, address).await
-                    }
+                    Protocol::Tcp => self.query_tcp_proxy(request, address).await,
                 },
             };
             match result {

@@ -93,7 +93,7 @@ DNS request rules choose an upstream; then the upstream hostname/IP and port are
 A `proxy` result uses NaiveProxy with TCP DNS, while `direct` uses a socket marked with `outbound_mark` when configured.
 A named upstream definitively routed to `proxy` is resolved by the remote server, without local bootstrap.
 `bootstrap` lookups for direct routes or IP-dependent rules still use direct sockets marked with `outbound_mark`
-when configured. UDP DNS cannot use NaiveProxy; a `tcp+udp` upstream uses TCP when routing selects `proxy`.
+when configured. UDP DNS cannot use NaiveProxy.
 
 `dns.max_tcp_connections` limits concurrent TCP DNS clients per listening address (default 64), separately from the proxy's
 `max_connections`. Once full, the listener waits for a connection to finish before accepting another.
