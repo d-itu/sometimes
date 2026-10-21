@@ -39,7 +39,7 @@ use rama::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, Semaphore},
     task::JoinHandle,
     time::timeout,
 };
@@ -53,6 +53,12 @@ use crate::{
     outbound::connect_outbound,
 };
 
+mod pool;
+
+use pool::{Allocation, Assignment, PoolPolicy, SessionPool, Slot, StreamPermit};
+
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub struct Client {
     upstream: Upstream,
     target: Target,
@@ -61,10 +67,7 @@ pub struct Client {
     authorization: HeaderValue,
     server_name: ServerName<'static>,
     resolver: Arc<Resolver>,
-    sessions: Mutex<Vec<Arc<Session>>>,
-    slots: Arc<Semaphore>,
-    changed: Arc<Notify>,
-    pending: Arc<Semaphore>,
+    pool: SessionPool,
 }
 
 pub struct Tunnel {
@@ -113,29 +116,6 @@ struct Session {
     draining: AtomicBool,
     changed: Arc<Notify>,
     _slot: Arc<Option<Slot>>,
-}
-
-struct PoolPolicy;
-
-impl PoolPolicy {
-    const CONNECTIONS: usize = 4;
-    const STREAMS: usize = 64;
-    const PENDING: usize = 128;
-    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
-}
-
-enum Assignment {
-    Stream(Arc<Session>, StreamPermit),
-    Connection(Slot),
-    Unavailable,
-}
-
-enum Allocation {
-    Any,
-    Available,
-    Existing,
-    Waiting,
-    Retry,
 }
 
 struct ConnectRequest<'a> {
@@ -203,30 +183,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ReservedIo<S> {
 
 struct Driver(Option<JoinHandle<()>>);
 
-struct Slot {
-    permit: Option<OwnedSemaphorePermit>,
-    changed: Arc<Notify>,
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        drop(self.permit.take());
-        self.changed.notify_waiters();
-    }
-}
-
-struct StreamPermit {
-    permit: Option<OwnedSemaphorePermit>,
-    changed: Arc<Notify>,
-}
-
-impl Drop for StreamPermit {
-    fn drop(&mut self) {
-        drop(self.permit.take());
-        self.changed.notify_waiters();
-    }
-}
-
 #[derive(Debug)]
 struct UnsentConnect;
 
@@ -284,110 +240,13 @@ impl Client {
             authorization,
             server_name,
             resolver,
-            sessions: Mutex::new(Vec::new()),
-            slots: Arc::new(Semaphore::new(PoolPolicy::CONNECTIONS)),
-            changed: Arc::new(Notify::new()),
-            pending: Arc::new(Semaphore::new(PoolPolicy::PENDING)),
+            pool: SessionPool::new(),
         })
     }
 
     pub async fn connect(&self, destination: impl Into<Authority>) -> Result<Tunnel> {
-        let _pending = self
-            .pending
-            .clone()
-            .try_acquire_owned()
-            .context("upstream CONNECT queue full")?;
+        let _pending = self.pool.enter()?;
         ConnectRequest::new(self, destination.into()).run().await
-    }
-
-    async fn assign(&self, allocation: Allocation, excluded: &[Weak<Session>]) -> Assignment {
-        let mut retiring: Option<Weak<Option<Slot>>> = None;
-        let eligible = |session: &Arc<Session>| {
-            !excluded
-                .iter()
-                .any(|failed| failed.as_ptr() == Arc::as_ptr(session))
-        };
-        loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let mut sessions = self.sessions.lock().await;
-            if matches!(allocation, Allocation::Retry)
-                && let Some(failed) = excluded.last()
-                && let Some(session) = failed.upgrade()
-                && !session.usable()
-                && session.active() == 0
-            {
-                // Cleanup may remove this session before its transport releases the slot.
-                retiring = Some(Arc::downgrade(&session._slot));
-            }
-            sessions.retain(|session| session.usable() || session.active() > 0);
-            let available = sessions
-                .iter()
-                .filter(|session| eligible(session))
-                .find_map(|session| {
-                    session
-                        .try_acquire()
-                        .map(|permit| (session.clone(), permit))
-                });
-            if let Some((session, permit)) = available {
-                drop(sessions);
-                return Assignment::Stream(session, permit);
-            }
-            if matches!(allocation, Allocation::Available)
-                || matches!(allocation, Allocation::Existing)
-                    && !sessions
-                        .iter()
-                        .any(|session| session.usable() && eligible(session))
-            {
-                return Assignment::Unavailable;
-            }
-            if matches!(allocation, Allocation::Retry)
-                && self.slots.available_permits() == 0
-                && retiring
-                    .as_ref()
-                    .is_none_or(|lease| lease.strong_count() == 0)
-            {
-                // Retire this request's failed session before considering unrelated sessions.
-                let preferred_index = excluded.last().and_then(|failed| {
-                    sessions
-                        .iter()
-                        .position(|session| failed.ptr_eq(&Arc::downgrade(session)))
-                });
-                let index = match preferred_index {
-                    Some(index) => (sessions[index].active() == 0).then_some(index),
-                    None => sessions.iter().position(|session| session.active() == 0),
-                };
-                if let Some(index) = index {
-                    let session = sessions.swap_remove(index);
-                    session.draining.store(true, Ordering::Relaxed);
-                    retiring = Some(Arc::downgrade(&session._slot));
-                    self.changed.notify_waiters();
-                }
-            }
-            let slot = (!matches!(allocation, Allocation::Existing | Allocation::Waiting))
-                .then(|| {
-                    self.slots
-                        .clone()
-                        .try_acquire_owned()
-                        .ok()
-                        .map(|permit| Slot {
-                            permit: Some(permit),
-                            changed: self.changed.clone(),
-                        })
-                })
-                .flatten();
-            drop(sessions);
-            if let Some(slot) = slot {
-                return Assignment::Connection(slot);
-            }
-            notified.await;
-        }
-    }
-
-    async fn publish_session(&self, session: Arc<Session>) {
-        self.sessions.lock().await.push(session);
-        self.changed.notify_waiters();
     }
 
     async fn establish(
@@ -395,7 +254,7 @@ impl Client {
         address: SocketAddr,
         slot: &mut Option<Slot>,
     ) -> Result<Arc<Session>> {
-        timeout(PoolPolicy::ATTEMPT_TIMEOUT, async {
+        timeout(ATTEMPT_TIMEOUT, async {
             let tcp = connect_outbound(address, self.outbound_mark).await?;
             self.handshake_session_reserved(TcpStream::new(tcp), Some(address), slot.take())
                 .await
@@ -438,7 +297,13 @@ impl Client {
             tls.get_ref().1.alpn_protocol() == Some(b"h2"),
             "upstream did not negotiate h2"
         );
-        Session::handshake_reserved(TlsStream::new(tls), self.changed.clone(), address, slot).await
+        Session::handshake_reserved(
+            TlsStream::new(tls),
+            self.pool.changed.clone(),
+            address,
+            slot,
+        )
+        .await
     }
 }
 
@@ -452,7 +317,7 @@ impl<'a> ConnectRequest<'a> {
     }
 
     async fn assign(&self, allocation: Allocation) -> Assignment {
-        self.client.assign(allocation, &self.failed).await
+        self.client.pool.assign(allocation, &self.failed).await
     }
 
     async fn while_connecting<F: Future>(&self, work: F) -> ConnectionProgress<F::Output> {
@@ -585,7 +450,7 @@ impl<'a> ConnectRequest<'a> {
                 ConnectionProgress::Ready(result) => {
                     addresses.next();
                     match result {
-                        Ok(session) => self.client.publish_session(session).await,
+                        Ok(session) => self.client.pool.publish(session).await,
                         Err(error) => {
                             last_error = Some(error.context(format!("upstream {address}")));
                         }
