@@ -366,7 +366,10 @@ impl Context {
             let socket = socket.clone();
             let context = self.clone();
             requests.spawn(async move {
-                match context.handle(&request).await {
+                let response = context.handle(&request).await.and_then(|response| {
+                    packet::udp_response(&request, response, context.config.max_packet_bytes)
+                });
+                match response {
                     Ok(response) => {
                         if let Err(error) = socket.send_to(&response, peer).await {
                             tracing::warn!(%error, "DNS UDP reply failed");
@@ -593,31 +596,12 @@ async fn query_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn tcp_queries_preserve_ids_across_sizes_and_cache_hits() {
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let upstream_address = upstream.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let mut buffer = [0; 512];
-            for _ in 0..2 {
-                let (size, peer) = upstream.recv_from(&mut buffer).await.unwrap();
-                let mut response = buffer[..size].to_vec();
-                response[2] |= 0x80;
-                response[6..8].copy_from_slice(&1u16.to_be_bytes());
-                response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
-                response.extend_from_slice(&60u32.to_be_bytes());
-                response.extend_from_slice(&[0, 4, 127, 0, 0, 1]);
-                upstream.send_to(&response, peer).await.unwrap();
-            }
-        });
+    fn direct_context(upstream: Upstream) -> Context {
         let config = Arc::new(Config {
-            upstreams: vec![Upstream {
-                port: upstream_address.port(),
-                ..Upstream::default()
-            }],
+            upstreams: vec![upstream],
             ..Config::default()
         });
-        let context = Context::new(
+        Context::new(
             config.clone(),
             Arc::new(ResponseCache::new(NonZeroUsize::new(2).unwrap())),
             Routing {
@@ -640,14 +624,102 @@ mod tests {
             ),
             Resolver::from_config(&config, None),
             None,
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn udp_truncation_preserves_full_tcp_and_cached_replies() {
+        timeout(Duration::from_secs(5), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let context = direct_context(Upstream {
+                port: upstream.local_addr().unwrap().port(),
+                protocol: Protocol::Tcp,
+                ..Upstream::default()
+            });
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let size = stream.read_u16().await.unwrap();
+                let mut response = vec![0; usize::from(size)];
+                stream.read_exact(&mut response).await.unwrap();
+                response[2..4].copy_from_slice(&[0x81, 0x80]);
+                response[6..8].copy_from_slice(&40u16.to_be_bytes());
+                for _ in 0..40 {
+                    response.extend_from_slice(&[
+                        0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1,
+                    ]);
+                }
+                stream.write_u16(response.len() as u16).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+            });
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let udp = tokio::spawn(context.clone().serve_udp(socket));
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut request = packet::make_query("example.com", 1);
+            let mut buffer = [0; 4096];
+            for id in [1u16, 2] {
+                request[..2].copy_from_slice(&id.to_be_bytes());
+                client.send_to(&request, address).await.unwrap();
+                let (size, _) = client.recv_from(&mut buffer).await.unwrap();
+                let response = &buffer[..size];
+                packet::validate_response(&request, response).unwrap();
+                assert_eq!(response[2] & 2, 2);
+                assert_eq!(&response[6..12], &[0; 6]);
+                assert!(size <= 512);
+            }
+            server.await.unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let tcp = tokio::spawn(context.handle_tcp(stream));
+            let response = query_tcp_stream(&mut client, &request, 4096).await.unwrap();
+            assert_eq!(response[2] & 2, 0);
+            assert_eq!(u16::from_be_bytes(response[6..8].try_into().unwrap()), 40);
+            assert_eq!(packet::answer_ips(&response).len(), 40);
+            assert!(response.len() > 512);
+            udp.abort();
+            tcp.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_queries_preserve_ids_across_sizes_and_cache_hits() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            for _ in 0..4 {
+                let (size, peer) = upstream.recv_from(&mut buffer).await.unwrap();
+                let mut response = buffer[..size].to_vec();
+                response[2] |= 0x80;
+                response[6..8].copy_from_slice(&1u16.to_be_bytes());
+                response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+                response.extend_from_slice(&60u32.to_be_bytes());
+                response.extend_from_slice(&[0, 4, 127, 0, 0, 1]);
+                upstream.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let context = direct_context(Upstream {
+            port: upstream_address.port(),
+            ..Upstream::default()
+        });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
         let (stream, _) = listener.accept().await.unwrap();
         let connection = tokio::spawn(context.handle_tcp(stream));
-        for (id, name) in [(1u16, "a.test"), (2, "longer.example.test"), (3, "a.test")] {
+        for (id, name) in [
+            (1u16, "a.test"),
+            (2, "longer.example.test"),
+            (3, "a.test"),
+            (4, "."),
+            (5, "127.0.0.1"),
+        ] {
             let mut request = packet::make_query(name, 1);
             request[..2].copy_from_slice(&id.to_be_bytes());
             let response = timeout(

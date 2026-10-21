@@ -1,13 +1,15 @@
-use std::net::IpAddr;
+use std::{fmt::Write, net::IpAddr};
 
 use anyhow::{Context, Result, ensure};
-
-use crate::routing::normalize_domain;
 
 pub(super) fn make_query(name: &str, qtype: u16) -> Vec<u8> {
     let mut p = vec![0x53, 0x54, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
     p[..2].copy_from_slice(&rand::random::<u16>().to_be_bytes());
-    for label in name.split('.') {
+    for label in name
+        .trim_end_matches('.')
+        .split('.')
+        .filter(|label| !label.is_empty())
+    {
         p.push(label.len() as u8);
         p.extend_from_slice(label.as_bytes());
     }
@@ -87,7 +89,7 @@ pub(super) fn answer_ips(packet: &[u8]) -> Vec<IpAddr> {
 }
 
 fn read_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
-    let mut labels = Vec::new();
+    let mut name = String::new();
     let mut pos = start;
     let mut end = None;
     let mut total = 0usize;
@@ -107,14 +109,24 @@ fn read_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
         }
         pos += 1;
         if len == 0 {
-            return Some((normalize_domain(&labels.join("."))?, end.unwrap_or(pos)));
+            return Some((name, end.unwrap_or(pos)));
         }
         total += usize::from(len) + 1;
-        if total > 255 {
+        if total > 254 {
             return None;
         }
         let bytes = packet.get(pos..pos.checked_add(usize::from(len))?)?;
-        labels.push(str::from_utf8(bytes).ok()?);
+        if !name.is_empty() {
+            name.push('.');
+        }
+        for &byte in bytes {
+            match byte {
+                b'!'..=b'~' if byte != b'.' && byte != b'\\' => {
+                    name.push(char::from(byte.to_ascii_lowercase()));
+                }
+                _ => write!(name, "\\{byte:03}").unwrap(),
+            }
+        }
         pos += usize::from(len);
     }
     None
@@ -155,21 +167,63 @@ pub(super) fn validate_response(request: &[u8], response: &[u8]) -> Result<()> {
 }
 
 pub(super) fn query_name(packet: &[u8]) -> Option<String> {
-    let mut pos = 12;
-    let mut labels = Vec::new();
-    loop {
-        let len = *packet.get(pos)? as usize;
-        pos += 1;
-        if len == 0 {
-            break;
+    read_name(packet, 12).map(|(name, _)| name)
+}
+
+pub(super) fn udp_response(
+    request: &[u8],
+    mut response: Vec<u8>,
+    max_packet_bytes: usize,
+) -> Result<Vec<u8>> {
+    let request_opt = opt_record(request)?;
+    let capacity = request_opt.map_or(512, |fields| {
+        usize::from(u16::from_be_bytes([fields[2], fields[3]])).max(512)
+    });
+    let server_capacity = max_packet_bytes.min(65_507);
+    if response.len() > capacity.min(server_capacity) {
+        let opt_flags = if let Some(fields) = request_opt {
+            Some(
+                opt_record(&response)?.map_or([0, 0, fields[6], fields[7]], |fields| {
+                    fields[4..8].try_into().unwrap()
+                }),
+            )
+        } else {
+            None
+        };
+        let end = skip_name(&response, 12).context("invalid DNS response question")? + 4;
+        ensure!(end <= response.len(), "invalid DNS response question");
+        response.truncate(end);
+        response[2] |= 0x02;
+        response[6..12].fill(0);
+        if let Some(flags) = opt_flags {
+            response[10..12].copy_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&[0, 0, 41]);
+            response.extend_from_slice(&(server_capacity as u16).to_be_bytes());
+            response.extend_from_slice(&flags);
+            response.extend_from_slice(&[0, 0]);
         }
-        if len > 63 || pos.checked_add(len)? > packet.len() {
-            return None;
-        }
-        labels.push(str::from_utf8(&packet[pos..pos + len]).ok()?);
-        pos += len;
     }
-    normalize_domain(&labels.join("."))
+    Ok(response)
+}
+
+fn opt_record(request: &[u8]) -> Result<Option<&[u8]>> {
+    let (qd, an, ns, ar) = header_counts(request).context("invalid DNS header")?;
+    let mut pos = 12;
+    for _ in 0..qd {
+        pos = skip_name(request, pos).context("invalid DNS question")? + 4;
+    }
+    let mut opt = None;
+    for index in 0..an + ns + ar {
+        pos = skip_name(request, pos).context("invalid DNS record name")?;
+        let fields = request.get(pos..pos + 10).context("invalid DNS record")?;
+        let record_type = u16::from_be_bytes([fields[0], fields[1]]);
+        if index >= an + ns && record_type == 41 {
+            opt = Some(fields);
+        }
+        pos += 10 + usize::from(u16::from_be_bytes([fields[8], fields[9]]));
+        ensure!(pos <= request.len(), "invalid DNS record data");
+    }
+    Ok(opt)
 }
 
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
@@ -259,6 +313,74 @@ pub(super) fn error_response(request: &[u8], rcode: u8) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_names_are_not_limited_to_routing_hostnames() {
+        for (name, expected) in [
+            (".", ""),
+            ("127.0.0.1", "127.0.0.1"),
+            ("_SIP._tcp.Example.COM.", "_sip._tcp.example.com"),
+            ("*.example.com", "*.example.com"),
+        ] {
+            assert_eq!(query(&make_query(name, 1)), Some((expected.into(), 1, 1)));
+        }
+        let mut packet = make_query("example.com", 1);
+        packet[13] = b'.';
+        assert_eq!(query_name(&packet).as_deref(), Some("\\046xample.com"));
+        packet[13] = 255;
+        assert_eq!(query_name(&packet).as_deref(), Some("\\255xample.com"));
+        let longest = format!("{}{}", ("a".repeat(63) + ".").repeat(3), "a".repeat(61));
+        assert_eq!(
+            query_name(&make_query(&longest, 1)).as_deref(),
+            Some(longest.as_str())
+        );
+        assert!(query_name(&make_query(&("a".repeat(63) + ".").repeat(4), 1)).is_none());
+    }
+
+    #[test]
+    fn udp_responses_respect_edns_and_server_limits() {
+        let request = make_query("example.com", 1);
+        let mut response = request.clone();
+        response[2..4].copy_from_slice(&[0x81, 0x80]);
+        response[6..8].copy_from_slice(&40u16.to_be_bytes());
+        for _ in 0..40 {
+            response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+        }
+        for (advertised, server_limit, truncated) in [
+            (None, 4096, true),
+            (Some(0u16), 4096, true),
+            (Some(512), 4096, true),
+            (Some(1232), 4096, false),
+            (Some(4096), 512, true),
+        ] {
+            let mut request = request.clone();
+            if let Some(size) = advertised {
+                request[10..12].copy_from_slice(&1u16.to_be_bytes());
+                request.extend_from_slice(&[0, 0, 41]);
+                request.extend_from_slice(&size.to_be_bytes());
+                request.extend_from_slice(&[0; 6]);
+            }
+            let reply = udp_response(&request, response.clone(), server_limit).unwrap();
+            assert_eq!(reply[2] & 2 != 0, truncated);
+            validate_response(&request, &reply).unwrap();
+            if truncated {
+                assert_eq!(reply.len(), if advertised.is_some() { 40 } else { 29 });
+                assert_eq!(&reply[6..10], &[0; 4]);
+                assert_eq!(opt_record(&reply).unwrap().is_some(), advertised.is_some());
+            } else {
+                assert_eq!(reply, response);
+            }
+        }
+        let mut request = request;
+        request[10..12].copy_from_slice(&1u16.to_be_bytes());
+        request.extend_from_slice(&[0, 0, 41, 2, 0, 0, 0, 0x80, 0, 0, 0]);
+        response[10..12].copy_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&[0, 0, 41, 16, 0, 1, 0, 0x80, 0, 0, 0]);
+        let reply = udp_response(&request, response, 4096).unwrap();
+        let opt = opt_record(&reply).unwrap().unwrap();
+        assert_eq!(&opt[2..4], &4096u16.to_be_bytes());
+        assert_eq!(&opt[4..8], &[1, 0, 0x80, 0]);
+    }
 
     #[test]
     fn policy_refusal_and_upstream_failure_have_distinct_rcodes() {

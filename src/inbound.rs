@@ -42,7 +42,7 @@ use rama::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
     task::{AbortHandle, JoinSet},
     time::timeout,
 };
@@ -393,6 +393,9 @@ pub async fn socks(
     permits: Arc<Semaphore>,
 ) -> Result<()> {
     let idle = Duration::from_secs(config.idle_timeout_secs);
+    let handshake_timeout = Duration::from_secs(config.connect_timeout_secs);
+    let negotiated = Arc::new(Notify::new());
+    let ready = negotiated.clone();
     let state = State {
         config,
         client,
@@ -400,6 +403,7 @@ pub async fn socks(
     };
     let connect = service_fn(move |input: ConnectRequest| {
         let state = state.clone();
+        ready.notify_one();
         async move {
             let conn = state
                 .connect(&input.authority.host.to_string(), input.authority.port)
@@ -412,9 +416,20 @@ pub async fn socks(
             relay(local, upstream, false, idle).await.map(|_| ())
         },
     );
-    Socks5Acceptor::new(Executor::default())
-        .with_connector(Connector::new(connect, forward))
-        .serve(RamaTcpStream::new(stream))
-        .await?;
+    let acceptor =
+        Socks5Acceptor::new(Executor::default()).with_connector(Connector::new(connect, forward));
+    let serving = acceptor.serve(RamaTcpStream::new(stream));
+    tokio::pin!(serving);
+    let completed = timeout(handshake_timeout, async {
+        tokio::select! {
+            result = &mut serving => Some(result),
+            _ = negotiated.notified() => None,
+        }
+    })
+    .await?;
+    match completed {
+        Some(result) => result?,
+        None => serving.await?,
+    }
     Ok(())
 }

@@ -14,6 +14,58 @@ use tokio::{
 };
 
 #[tokio::test]
+async fn socks_handshake_deadline_releases_connections_without_limiting_tunnels() {
+    timeout(Duration::from_secs(10), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut config = config(Action::Direct);
+        config.max_connections = 1;
+        config.connect_timeout_secs = 1;
+        config.listeners[0].port = address.port();
+        config.listeners[0].protocol = crate::config::InboundProtocol::Socks;
+        let server = tokio::spawn(crate::linux::run(Arc::new(config)));
+        let mut stalled = loop {
+            match TcpStream::connect(address).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        stalled.write_all(&[5]).await.unwrap();
+        assert_eq!(stalled.read(&mut [0]).await.unwrap(), 0);
+
+        let mut stalled = TcpStream::connect(address).await.unwrap();
+        stalled.write_all(&[5, 1, 0]).await.unwrap();
+        let mut greeting = [0; 2];
+        stalled.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 0]);
+        stalled.write_all(&[5, 1, 0, 1, 127]).await.unwrap();
+        assert_eq!(stalled.read(&mut [0]).await.unwrap(), 0);
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(&[5, 1, 0]).await.unwrap();
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&target.local_addr().unwrap().port().to_be_bytes());
+        stream.write_all(&request).await.unwrap();
+        let mut reply = [0; 10];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+        let (mut peer, _) = target.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        stream.write_all(b"alive").await.unwrap();
+        let mut payload = [0; 5];
+        peer.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"alive");
+        server.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn resolved_addresses_retry_direct_and_recheck_routing() {
     timeout(Duration::from_secs(5), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
