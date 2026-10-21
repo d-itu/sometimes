@@ -47,6 +47,19 @@ pub fn normalize_domain(value: &str) -> Option<String> {
     Some(name)
 }
 
+pub(crate) fn matches_domain(name: &str, domains: &[String]) -> bool {
+    domains.iter().any(|domain| domain == name)
+}
+
+pub(crate) fn matches_domain_suffix(name: &str, suffixes: &[String]) -> bool {
+    suffixes.iter().any(|suffix| {
+        name == suffix
+            || name
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
 impl Routing {
     /// Decide without an address only when no earlier matching rule needs one.
     pub fn select_before_dns(&self, domain: &str, port: u16) -> Option<Action> {
@@ -54,16 +67,10 @@ impl Routing {
             if !rule.ports.is_empty() && !rule.ports.contains(&port) {
                 continue;
             }
-            if !rule.domain.is_empty() && !rule.domain.iter().any(|d| d == domain) {
+            if !rule.domain.is_empty() && !matches_domain(domain, &rule.domain) {
                 continue;
             }
-            if !rule.domain_suffix.is_empty()
-                && !rule.domain_suffix.iter().any(|suffix| {
-                    domain == suffix
-                        || domain
-                            .strip_suffix(suffix)
-                            .is_some_and(|p| p.ends_with('.'))
-                })
+            if !rule.domain_suffix.is_empty() && !matches_domain_suffix(domain, &rule.domain_suffix)
             {
                 continue;
             }
@@ -97,16 +104,10 @@ impl Routing {
             .enumerate()
             .find(|(_, rule)| {
                 (rule.domain.is_empty()
-                    || domain.is_some_and(|name| rule.domain.iter().any(|d| d == name)))
+                    || domain.is_some_and(|name| matches_domain(name, &rule.domain)))
                     && (rule.domain_suffix.is_empty()
-                        || domain.is_some_and(|name| {
-                            rule.domain_suffix.iter().any(|suffix| {
-                                name == suffix
-                                    || name
-                                        .strip_suffix(suffix)
-                                        .is_some_and(|prefix| prefix.ends_with('.'))
-                            })
-                        }))
+                        || domain
+                            .is_some_and(|name| matches_domain_suffix(name, &rule.domain_suffix)))
                     && (rule.ip_cidr.is_empty()
                         || rule
                             .ip_cidr
@@ -184,6 +185,33 @@ mod tests {
                 routing.select(ip.parse().unwrap(), None),
                 (Action::Reject, Some(2))
             );
+        }
+    }
+
+    #[test]
+    fn domain_conditions_are_combined_before_and_after_dns() {
+        let mut routing: Routing = toml::from_str(
+            r#"
+            default = "proxy"
+            [[rules]]
+            domain = ["Allowed.Example.COM.", "other.test"]
+            domain_suffix = ["Example.COM."]
+            action = "direct"
+            "#,
+        )
+        .unwrap();
+        routing.prepare().unwrap();
+        let destination = "203.0.113.1:443".parse().unwrap();
+        for (name, expected) in [
+            (Some("allowed.example.com"), (Action::Direct, Some(0))),
+            (Some("other.test"), (Action::Proxy, None)),
+            (Some("www.example.com"), (Action::Proxy, None)),
+            (None, (Action::Proxy, None)),
+        ] {
+            assert_eq!(routing.select(destination, name), expected);
+            if let Some(name) = name {
+                assert_eq!(routing.select_before_dns(name, 443), Some(expected.0));
+            }
         }
     }
 

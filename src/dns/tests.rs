@@ -355,6 +355,7 @@ fn prepared_routing_preserves_normalization_order_and_suffix_boundaries() {
             default = 'direct'
             [[routing.rules]]
             domain = ['Allowed.Example.COM.']
+            domain_suffix = ['Other.TEST.']
             upstream = 'other'
             [[routing.rules]]
             domain_suffix = ['Example.COM.']
@@ -375,10 +376,14 @@ fn prepared_routing_preserves_normalization_order_and_suffix_boundaries() {
     config.validate().unwrap();
     let routing = PreparedRouting::new(&config);
     assert_eq!(routing.target("allowed.example.com"), Some(0));
+    assert_eq!(routing.target("other.test"), Some(0));
+    assert_eq!(routing.target("www.other.test"), Some(0));
     assert_eq!(routing.target("example.com"), None);
     assert_eq!(routing.target("www.example.com"), None);
     assert_eq!(routing.target("notexample.com"), Some(1));
-    assert_eq!(routing.target("other.test"), Some(1));
+    assert_eq!(routing.target("example.com.evil"), Some(1));
+    assert_eq!(routing.target("notother.test"), Some(1));
+    assert_eq!(routing.target("unmatched.test"), Some(1));
 }
 
 #[test]

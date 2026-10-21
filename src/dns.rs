@@ -17,7 +17,7 @@ use tokio::{
 
 use crate::{
     naive::client::Client,
-    routing::{Routing, normalize_domain},
+    routing::{Routing, matches_domain, matches_domain_suffix, normalize_domain},
 };
 
 pub mod bootstrap;
@@ -247,10 +247,7 @@ impl PreparedRouting {
 
     fn target(&self, name: &str) -> Option<usize> {
         let rule = self.rules.iter().find(|rule| {
-            rule.domain.iter().any(|item| item == name)
-                || rule.domain_suffix.iter().any(|item| {
-                    name == item || name.strip_suffix(item).is_some_and(|p| p.ends_with('.'))
-                })
+            matches_domain(name, &rule.domain) || matches_domain_suffix(name, &rule.domain_suffix)
         });
         rule.map_or(Some(self.default), |rule| rule.upstream)
     }
