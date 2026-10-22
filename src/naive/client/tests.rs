@@ -266,7 +266,7 @@ async fn retry_next_address_with_zero_capacity(
         let zero_session = if zero_capacity {
             let (session, server) = pooled_test_session(&client, 0).await;
             assert_eq!(session.max_streams.get(), 0);
-            client.pool.publish(session.clone()).await;
+            client.pool.publish(session.clone());
             Some((session, server))
         } else {
             None
@@ -284,7 +284,7 @@ async fn retry_next_address_with_zero_capacity(
             .unwrap();
         let connections =
             if reject_connect && !full_pool { 2 } else { 1 } + usize::from(zero_capacity);
-        assert_eq!(client.pool.sessions.lock().await.len(), connections);
+        assert_eq!(client.pool.sessions.lock().unwrap().len(), connections);
         assert_eq!(
             client.pool.slots.available_permits(),
             PoolPolicy::CONNECTIONS - connections - reserved.len()
@@ -299,7 +299,7 @@ async fn retry_next_address_with_zero_capacity(
                 .unwrap();
             assert!(Arc::ptr_eq(
                 &other._session,
-                &client.pool.sessions.lock().await[usize::from(zero_capacity)]
+                &client.pool.sessions.lock().unwrap()[usize::from(zero_capacity)]
             ));
             drop(other);
         }
@@ -402,7 +402,7 @@ async fn publishes_session_before_first_connect_completes() {
             .await
             .unwrap();
         assert!(!received.recv().await.unwrap());
-        assert_eq!(client.pool.sessions.lock().await.len(), 1);
+        assert_eq!(client.pool.sessions.lock().unwrap().len(), 1);
         assert_eq!(client.pool.slots.available_permits(), 3);
         first.abort();
         assert!(matches!(first.await, Err(error) if error.is_cancelled()));
@@ -415,7 +415,7 @@ async fn publishes_session_before_first_connect_completes() {
             .await
             .unwrap();
         assert!(!received.recv().await.unwrap());
-        assert_eq!(client.pool.sessions.lock().await.len(), 1);
+        assert_eq!(client.pool.sessions.lock().unwrap().len(), 1);
         assert_eq!(client.pool.slots.available_permits(), 3);
         drop(third);
         drop(second);
@@ -499,7 +499,7 @@ async fn full_session_does_not_block_replacement() {
         for _ in 0..64 {
             permits.push(old.streams.clone().acquire_owned().await.unwrap());
         }
-        client.pool.sessions.lock().await.push(old.clone());
+        client.pool.sessions.lock().unwrap().push(old.clone());
         let destination: Authority =
             HostWithPort::new(Domain::try_from("example.com").unwrap().into(), 443).into();
         let tunnel = client.connect(destination).await.unwrap();
@@ -560,7 +560,7 @@ async fn reuses_session_and_obeys_peer_stream_limit() {
         )
         .await
         .unwrap();
-        client.pool.sessions.lock().await.push(session.clone());
+        client.pool.sessions.lock().unwrap().push(session.clone());
         let destination: Authority =
             HostWithPort::new(Domain::try_from("example.com").unwrap().into(), 443).into();
         let first = client.connect(destination.clone()).await.unwrap();
@@ -570,7 +570,7 @@ async fn reuses_session_and_obeys_peer_stream_limit() {
         drop(first);
         let second = client.connect(destination).await.unwrap();
         received.recv().await.unwrap();
-        assert_eq!(client.pool.sessions.lock().await.len(), 1);
+        assert_eq!(client.pool.sessions.lock().unwrap().len(), 1);
         drop(second);
         drop(client);
         drop(session);
@@ -813,7 +813,7 @@ async fn concurrent_connection_attempts_are_bounded_and_cancel_safe() {
             PoolPolicy::CONNECTIONS
         );
         assert_eq!(client.pool.pending.available_permits(), PoolPolicy::PENDING);
-        assert!(client.pool.sessions.lock().await.is_empty());
+        assert!(client.pool.sessions.lock().unwrap().is_empty());
         server.abort();
     })
     .await
@@ -927,9 +927,9 @@ async fn zero_capacity_session_waiter_reuses_other_session() {
         let client = test_pool();
         let (busy, busy_server) = pooled_test_session(&client, 1).await;
         let occupied = busy.try_acquire().unwrap();
-        client.pool.sessions.lock().await.push(busy.clone());
+        client.pool.sessions.lock().unwrap().push(busy.clone());
         let (zero, zero_server) = pooled_test_session(&client, 0).await;
-        client.pool.publish(zero.clone()).await;
+        client.pool.publish(zero.clone());
         let request = ConnectRequest::new(&client, "example.com:443".parse().unwrap());
         let mut waiting = Box::pin(request.stream());
         assert!(
@@ -937,7 +937,7 @@ async fn zero_capacity_session_waiter_reuses_other_session() {
                 .await
                 .is_err()
         );
-        assert_eq!(client.pool.sessions.lock().await.len(), 2);
+        assert_eq!(client.pool.sessions.lock().unwrap().len(), 2);
         drop(occupied);
         let (assigned, permit) = waiting.await.unwrap();
         assert!(Arc::ptr_eq(&assigned, &busy));
@@ -1025,8 +1025,8 @@ async fn retry_published_session(prefailed: bool, succeeds: bool, last_fails: bo
         client.tls = tls;
         let (first, first_server) = pooled_test_session_with_status(&client, 1, 503).await;
         let (second, second_server) = pooled_test_session_with_status(&client, 1, 503).await;
-        client.pool.publish(first.clone()).await;
-        client.pool.publish(second.clone()).await;
+        client.pool.publish(first.clone());
+        client.pool.publish(second.clone());
         let mut request = ConnectRequest::new(&client, "example.com:443".parse().unwrap());
         if prefailed {
             for session in [&first, &second] {
@@ -1058,7 +1058,7 @@ async fn retry_published_session(prefailed: bool, succeeds: bool, last_fails: bo
             let notified = client.pool.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if client.pool.sessions.lock().await.len() == 3 {
+            if client.pool.sessions.lock().unwrap().len() == 3 {
                 break;
             }
             tokio::select! {
@@ -1071,7 +1071,7 @@ async fn retry_published_session(prefailed: bool, succeeds: bool, last_fails: bo
         // The last TLS attempt has failed while the earlier session is still at zero capacity.
         failing_server.await.unwrap();
         {
-            let sessions = client.pool.sessions.lock().await;
+            let sessions = client.pool.sessions.lock().unwrap();
             assert_eq!(sessions.len(), 3);
             assert_eq!(sessions[2].max_streams.get(), 0);
             assert_eq!(first.active(), 0);
@@ -1107,8 +1107,8 @@ async fn retry_waiting_for_connection_budget_reuses_released_stream() {
         let client = test_pool();
         let (healthy, healthy_server) = pooled_test_session(&client, 1).await;
         let (failed, failed_server) = pooled_test_session_with_status(&client, 1, 503).await;
-        client.pool.publish(healthy.clone()).await;
-        client.pool.publish(failed.clone()).await;
+        client.pool.publish(healthy.clone());
+        client.pool.publish(failed.clone());
         let reserved: Vec<_> = (0..PoolPolicy::CONNECTIONS - 2)
             .map(|_| client.pool.slots.clone().try_acquire_owned().unwrap())
             .collect();
@@ -1176,7 +1176,7 @@ async fn transport_retains_stream_permit_until_dropped() {
 async fn last_tcp_failure_releases_unused_slot_before_waiting() {
     let client = test_pool();
     let (session, server) = pooled_test_session(&client, 0).await;
-    client.pool.publish(session.clone()).await;
+    client.pool.publish(session.clone());
     let other_slots: Vec<_> = (0..PoolPolicy::CONNECTIONS - 2)
         .map(|_| client.pool.slots.clone().try_acquire_owned().unwrap())
         .collect();
@@ -1230,7 +1230,7 @@ async fn dns_failure_with_pooled_session(available: bool) {
         );
         let (session, server) = pooled_test_session(&client, 1).await;
         let busy = session.try_acquire().unwrap();
-        client.pool.publish(session.clone()).await;
+        client.pool.publish(session.clone());
         let mut pending = Box::pin(client.connect("example.com:443".parse::<Authority>().unwrap()));
         assert!(
             poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx)))
@@ -1288,7 +1288,7 @@ async fn retry_failed_session(broken: bool) {
             .pool
             .sessions
             .lock()
-            .await
+            .unwrap()
             .extend([healthy.clone(), failed.clone()]);
         let reserved: Vec<_> = (0..PoolPolicy::CONNECTIONS - 2)
             .map(|_| client.pool.slots.clone().try_acquire_owned().unwrap())
@@ -1303,7 +1303,7 @@ async fn retry_failed_session(broken: bool) {
                 .is_err()
         );
         assert!(!healthy.draining.load(Ordering::Relaxed));
-        assert_eq!(client.pool.sessions.lock().await.len(), 2);
+        assert_eq!(client.pool.sessions.lock().unwrap().len(), 2);
         drop(active);
         if broken {
             failed.health.mark_broken();
@@ -1315,7 +1315,7 @@ async fn retry_failed_session(broken: bool) {
         );
         assert!(!failed.usable());
         {
-            let sessions = client.pool.sessions.lock().await;
+            let sessions = client.pool.sessions.lock().unwrap();
             assert_eq!(sessions.len(), 1);
             assert!(Arc::ptr_eq(&sessions[0], &healthy));
         }
@@ -1343,7 +1343,7 @@ async fn published_session_waiter_wakes_when_all_sessions_break() {
     timeout(Duration::from_secs(5), async {
         let client = test_pool();
         let (zero, server) = pooled_test_session(&client, 0).await;
-        client.pool.publish(zero.clone()).await;
+        client.pool.publish(zero.clone());
         let request = ConnectRequest::new(&client, "example.com:443".parse().unwrap());
         let mut waiting = Box::pin(request.stream());
         assert!(
@@ -1353,7 +1353,7 @@ async fn published_session_waiter_wakes_when_all_sessions_break() {
         );
         zero.health.mark_broken();
         assert!(matches!(waiting.await, Err(error) if error.is::<UnsentConnect>()));
-        assert!(client.pool.sessions.lock().await.is_empty());
+        assert!(client.pool.sessions.lock().unwrap().is_empty());
         drop(request);
         drop(zero);
         drop(client);
@@ -1371,7 +1371,7 @@ async fn warm_pool_retries_other_sessions_after_connect_rejection() {
         let (second, second_server) = pooled_test_session_with_status(&client, 1, 502).await;
         let (healthy, healthy_server) = pooled_test_session(&client, 1).await;
         for session in [&first, &second, &healthy] {
-            client.pool.publish(session.clone()).await;
+            client.pool.publish(session.clone());
         }
 
         let tunnel = client
@@ -1381,7 +1381,7 @@ async fn warm_pool_retries_other_sessions_after_connect_rejection() {
         assert!(Arc::ptr_eq(&tunnel._session, &healthy));
         assert!(first.usable());
         assert!(second.usable());
-        assert_eq!(client.pool.sessions.lock().await.len(), 3);
+        assert_eq!(client.pool.sessions.lock().unwrap().len(), 3);
         assert_eq!(client.pool.slots.available_permits(), 1);
 
         drop(tunnel);
@@ -1434,7 +1434,7 @@ async fn warm_pool_replacement(full_pool: bool) {
         client.server_name = ServerName::try_from("proxy.test").unwrap();
         client.tls = tls;
         let (rejected, rejected_server) = pooled_test_session_with_status(&client, 1, 503).await;
-        client.pool.publish(rejected).await;
+        client.pool.publish(rejected);
         let reserved: Vec<_> = (0..if full_pool {
             PoolPolicy::CONNECTIONS - 1
         } else {
@@ -1449,7 +1449,7 @@ async fn warm_pool_replacement(full_pool: bool) {
             .unwrap();
         assert_eq!(tunnel._session.address, Some(address));
         assert_eq!(
-            client.pool.sessions.lock().await.len(),
+            client.pool.sessions.lock().unwrap().len(),
             if full_pool { 1 } else { 2 }
         );
 
@@ -1583,7 +1583,7 @@ async fn stalled_establishment(settings: bool, cancel: bool, reject_reuse: bool)
             &client, 1, if reject_reuse { 503 } else { 200 },
         ).await;
         let busy = session.try_acquire().unwrap();
-        client.pool.sessions.lock().await.push(session.clone());
+        client.pool.sessions.lock().unwrap().push(session.clone());
         let (ready, accepted) = oneshot::channel();
         let slow_server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -1625,10 +1625,10 @@ async fn stalled_establishment(settings: bool, cancel: bool, reject_reuse: bool)
         if !reject_reuse {
             slow_server.await.unwrap();
             assert_eq!(client.pool.slots.available_permits(), PoolPolicy::CONNECTIONS - 1);
-            assert_eq!(client.pool.sessions.lock().await.len(), 1);
+            assert_eq!(client.pool.sessions.lock().unwrap().len(), 1);
             assert_eq!(session.active(), 0);
         } else {
-            assert_eq!(client.pool.sessions.lock().await.len(), 2);
+            assert_eq!(client.pool.sessions.lock().unwrap().len(), 2);
             drop(client);
             slow_server.await.unwrap();
             drop(session);
@@ -1683,7 +1683,7 @@ async fn draining_session_keeps_connection_slot_until_last_owner_drops() {
         let other_slots: Vec<_> = (0..3)
             .map(|_| client.pool.slots.clone().try_acquire_owned().unwrap())
             .collect();
-        client.pool.sessions.lock().await.push(session.clone());
+        client.pool.sessions.lock().unwrap().push(session.clone());
         let stream = session.try_acquire().unwrap();
         session.draining.store(true, Ordering::Relaxed);
         assert!(client.pool.slots.clone().try_acquire_owned().is_err());
@@ -1702,14 +1702,14 @@ async fn draining_session_keeps_connection_slot_until_last_owner_drops() {
                 .await
                 .is_err()
         );
-        assert!(client.pool.sessions.lock().await.is_empty());
+        assert!(client.pool.sessions.lock().unwrap().is_empty());
         assert_eq!(client.pool.slots.available_permits(), 0);
         drop(last_owner);
         assert_eq!(client.pool.slots.available_permits(), 0);
         let Assignment::Connection(slot) = assignment.await else {
             panic!("retry must reserve a connection slot")
         };
-        assert!(client.pool.sessions.lock().await.is_empty());
+        assert!(client.pool.sessions.lock().unwrap().is_empty());
         assert_eq!(client.pool.slots.available_permits(), 0);
         drop(slot);
         assert_eq!(client.pool.slots.available_permits(), 1);

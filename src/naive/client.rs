@@ -450,7 +450,7 @@ impl<'a> ConnectRequest<'a> {
                 ConnectionProgress::Ready(result) => {
                     addresses.next();
                     match result {
-                        Ok(session) => self.client.pool.publish(session).await,
+                        Ok(session) => self.client.pool.publish(session),
                         Err(error) => {
                             last_error = Some(error.context(format!("upstream {address}")));
                         }
@@ -609,10 +609,12 @@ impl Session {
         permit: StreamPermit,
     ) -> Result<Tunnel> {
         // Characters from the long-code region of the HPACK Huffman table.
-        let padding: String = (0..rand::random_range(16..=32))
-            .map(|_| ['!', '"', '#', '$', '\''][rand::random_range(0..5)])
-            .collect();
-        let mut padding = HeaderValue::from_str(&padding)?;
+        let mut padding = [0; 32];
+        let len = rand::random_range(16..=padding.len());
+        for byte in &mut padding[..len] {
+            *byte = b"!\"#$'"[rand::random_range(0..5)];
+        }
+        let mut padding = HeaderValue::from_bytes(&padding[..len])?;
         padding.set_sensitive(true);
         let request = Request::builder()
             .method(Method::CONNECT)
