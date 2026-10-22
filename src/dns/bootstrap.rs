@@ -94,6 +94,7 @@ impl Resolver {
         let max_packet_bytes = self.max_packet_bytes;
         let mark = self.mark;
         let mut queries = tokio::task::JoinSet::new();
+        let mut deadline = tokio::time::Instant::now() + timeout;
         for qtype in [1u16, 28] {
             for &server in &self.servers {
                 let request = make_query(name, qtype);
@@ -109,10 +110,17 @@ impl Resolver {
                 });
             }
         }
-        while let Some(query) = queries.join_next().await {
+        while let Ok(Some(query)) = tokio::time::timeout_at(deadline, queries.join_next()).await {
             if let Ok((Ok(response), received_at)) = query {
                 let ips = answer_ips(&response);
                 if !ips.is_empty() {
+                    if result.is_empty() {
+                        let now = tokio::time::Instant::now();
+                        // Collect nearby answers without consuming the remaining query budget.
+                        let grace = (deadline.saturating_duration_since(now) / 4)
+                            .min(Duration::from_millis(50));
+                        deadline = now + grace;
+                    }
                     let ttl = cache_ttls(&response).map_or(0, |(seconds, _)| seconds);
                     let deadline = received_at + Duration::from_secs(ttl.into());
                     expires =
@@ -239,7 +247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_for_other_queries_does_not_extend_ttl() {
+    async fn slow_secondary_answer_does_not_delay_addresses_or_extend_ttl() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let resolver = Resolver::from_config(
             &Config {
@@ -271,7 +279,12 @@ mod tests {
                 .unwrap();
         });
         let target = Target::new("bootstrap.example", 53);
-        let addresses = resolver.resolve_host(&target).await.unwrap();
+        let started = Instant::now();
+        let addresses =
+            tokio::time::timeout(Duration::from_millis(500), resolver.resolve_host(&target))
+                .await
+                .expect("a valid address must not wait for the slow secondary answer")
+                .unwrap();
         assert_eq!(
             addresses.as_ref(),
             &["127.0.0.1:53".parse::<SocketAddr>().unwrap()]
@@ -280,7 +293,9 @@ mod tests {
             unreachable!()
         };
         let entry = resolver.cache.lock().unwrap().peek(&key).unwrap().clone();
-        assert!(entry.lock().await.is_none());
+        let cached = entry.lock().await;
+        let cached = cached.as_ref().expect("the valid answer must be cached");
+        assert!(cached.expires <= started + Duration::from_millis(1100));
         server.await.unwrap();
     }
 

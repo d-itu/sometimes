@@ -1,12 +1,18 @@
+use std::io;
+
 use super::upstream::{query_tcp_stream, query_udp};
 use super::*;
 use crate::routing::Action as RouteAction;
 
 fn direct_context(upstream: Upstream) -> Context {
-    let config = Arc::new(Config {
+    direct_context_with_config(Config {
         upstreams: vec![upstream],
         ..Config::default()
-    });
+    })
+}
+
+fn direct_context_with_config(config: Config) -> Context {
+    let config = Arc::new(config);
     Context::new(
         config.clone(),
         Arc::new(ResponseCache::new(NonZeroUsize::new(2).unwrap())),
@@ -159,6 +165,73 @@ fn rejects_invalid_dns_upstream_references() {
     config.validate().unwrap();
     config.upstreams.push(config.upstreams[0].clone());
     assert!(config.validate().is_err());
+}
+
+#[tokio::test]
+async fn valid_bootstrap_address_survives_unresponsive_queries() {
+    timeout(Duration::from_secs(3), async {
+        for extra_server in [false, true] {
+            let bootstrap = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let upstream = Upstream {
+                host: "resolver.example".into(),
+                port: origin.local_addr().unwrap().port(),
+                ..Upstream::default()
+            };
+            let mut servers = vec![bootstrap.local_addr().unwrap()];
+            if extra_server {
+                servers.push(silent.local_addr().unwrap());
+            }
+            let context = direct_context_with_config(Config {
+                upstreams: vec![upstream.clone()],
+                bootstrap: servers,
+                timeout_ms: 300,
+                ..Config::default()
+            });
+            let bootstrap_task = tokio::spawn(async move {
+                let mut buffer = [0; 512];
+                for _ in 0..2 {
+                    let (size, peer) = bootstrap.recv_from(&mut buffer).await.unwrap();
+                    let mut response = buffer[..size].to_vec();
+                    if response[size - 4..size - 2] == [0, 1] {
+                        response[2] |= 0x80;
+                        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+                        response.extend_from_slice(&[
+                            0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1,
+                        ]);
+                        bootstrap.send_to(&response, peer).await.unwrap();
+                    } else if extra_server {
+                        response[2] |= 0x80;
+                        bootstrap.send_to(&response, peer).await.unwrap();
+                    }
+                }
+                bootstrap
+            });
+            let origin_task = tokio::spawn(async move {
+                let mut buffer = [0; 512];
+                for _ in 0..2 {
+                    let (size, peer) = origin.recv_from(&mut buffer).await.unwrap();
+                    buffer[2] |= 0x80;
+                    origin.send_to(&buffer[..size], peer).await.unwrap();
+                }
+            });
+            let prepared = PreparedUpstream::new(&upstream);
+            let request = packet::make_query("example.com", 1);
+            for _ in 0..2 {
+                let response = context.queries.query(&request, &prepared).await.unwrap();
+                packet::validate_response(&request, &response).unwrap();
+            }
+            let bootstrap = bootstrap_task.await.unwrap();
+            assert!(matches!(
+                bootstrap.try_recv_from(&mut [0; 512]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            ));
+            origin_task.await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
