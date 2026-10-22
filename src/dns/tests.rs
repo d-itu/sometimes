@@ -16,10 +16,7 @@ fn direct_context_with_config(config: Config) -> Context {
     Context::new(
         config.clone(),
         Arc::new(ResponseCache::new(NonZeroUsize::new(2).unwrap())),
-        Routing {
-            default: RouteAction::Direct,
-            ..Routing::default()
-        },
+        Routing::new(RouteAction::Direct),
         Arc::new(
             Client::new(
                 crate::config::Upstream {
@@ -296,10 +293,7 @@ async fn multiple_unresponsive_addresses_share_one_query_deadline() {
     let context = Context::new(
         config.clone(),
         Arc::new(ResponseCache::new(NonZeroUsize::new(1).unwrap())),
-        Routing {
-            default: RouteAction::Direct,
-            ..Routing::default()
-        },
+        Routing::new(RouteAction::Direct),
         client,
         Resolver::from_config(&config, None),
         None,

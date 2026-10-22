@@ -15,15 +15,22 @@ pub enum Action {
 }
 
 #[derive(Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(try_from = "Config")]
 pub struct Routing {
-    pub default: Action,
-    pub rules: Vec<Rule>,
+    default: Action,
+    rules: Vec<Rule>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Config {
+    default: Action,
+    rules: Vec<Rule>,
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Rule {
+struct Rule {
     pub action: Action,
     #[serde(default)]
     pub domain: Vec<String>,
@@ -70,6 +77,13 @@ pub(crate) fn matches_domain_suffix(name: &str, suffixes: &[String]) -> bool {
 }
 
 impl Routing {
+    pub fn new(default: Action) -> Self {
+        Self {
+            default,
+            rules: Vec::new(),
+        }
+    }
+
     /// Decide without an address only when no earlier matching rule needs one.
     pub fn select_before_dns(&self, domain: &str, port: u16) -> Option<Action> {
         for rule in &self.rules {
@@ -86,24 +100,6 @@ impl Routing {
             return rule.ip_cidr.is_empty().then_some(rule.action);
         }
         Some(self.default)
-    }
-    /// Compile domain conditions once, before accepting connections.
-    pub fn prepare(&mut self) -> Result<()> {
-        for rule in &mut self.rules {
-            ensure!(
-                !rule.domain.is_empty()
-                    || !rule.domain_suffix.is_empty()
-                    || !rule.ip_cidr.is_empty()
-                    || !rule.ports.is_empty(),
-                "routing rules need a condition; use routing.default for the fallback"
-            );
-            ensure!(!rule.ports.contains(&0), "routing ports must be nonzero");
-            for domain in rule.domain.iter_mut().chain(&mut rule.domain_suffix) {
-                *domain = normalize_domain(domain)
-                    .ok_or_else(|| anyhow::anyhow!("invalid routing domain"))?;
-            }
-        }
-        Ok(())
     }
 
     /// Different condition types are ANDed; values within a condition are ORed.
@@ -130,32 +126,56 @@ impl Routing {
     }
 }
 
+impl TryFrom<Config> for Routing {
+    type Error = anyhow::Error;
+
+    fn try_from(mut config: Config) -> Result<Self> {
+        for rule in &mut config.rules {
+            ensure!(
+                !rule.domain.is_empty()
+                    || !rule.domain_suffix.is_empty()
+                    || !rule.ip_cidr.is_empty()
+                    || !rule.ports.is_empty(),
+                "routing rules need a condition; use routing.default for the fallback"
+            );
+            ensure!(!rule.ports.contains(&0), "routing ports must be nonzero");
+            for domain in rule.domain.iter_mut().chain(&mut rule.domain_suffix) {
+                *domain = normalize_domain(domain)
+                    .ok_or_else(|| anyhow::anyhow!("invalid routing domain"))?;
+            }
+        }
+        Ok(Self {
+            default: config.default,
+            rules: config.rules,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn pre_dns_rejection_preserves_ip_rule_precedence() {
-        let mut routing: Routing = toml::from_str(
+        let routing: Routing = toml::from_str(
             "default = 'proxy'\n[[rules]]\ndomain = ['blocked.example']\naction = 'reject'",
         )
         .unwrap();
-        routing.prepare().unwrap();
         let name = normalize_domain("Blocked.Example.").unwrap();
         assert_eq!(routing.select_before_dns(&name, 443), Some(Action::Reject));
 
-        let mut routing: Routing = toml::from_str(
-            "default = 'proxy'\n[[rules]]\nip_cidr = ['10.0.0.0/8']\naction = 'direct'\n[[rules]]\ndomain = ['blocked.example']\naction = 'reject'",
-        )
+        let routing: Routing = toml::from_str(concat!(
+            "default = 'proxy'\n[[rules]]\nip_cidr = ['10.0.0.0/8']\naction = 'direct'\n",
+            "[[rules]]\ndomain = ['blocked.example']\naction = 'reject'",
+        ))
         .unwrap();
-        routing.prepare().unwrap();
         assert_eq!(routing.select_before_dns(&name, 443), None);
         assert_eq!(routing.select_before_dns("other.example", 443), None);
     }
 
     #[test]
     fn ordered_conditions_and_domain_boundaries() {
-        let mut routing: Routing = toml::from_str(
+        let routing: Routing = toml::from_str(
             r#"
             default = "proxy"
             [[rules]]
@@ -171,7 +191,6 @@ mod tests {
         "#,
         )
         .unwrap();
-        routing.prepare().unwrap();
         let dst = "203.0.113.1:443".parse().unwrap();
         assert_eq!(
             routing.select(dst, Some("blocked.example.com")),
@@ -199,7 +218,7 @@ mod tests {
 
     #[test]
     fn domain_conditions_are_combined_before_and_after_dns() {
-        let mut routing: Routing = toml::from_str(
+        let routing: Routing = toml::from_str(
             r#"
             default = "proxy"
             [[rules]]
@@ -209,7 +228,6 @@ mod tests {
             "#,
         )
         .unwrap();
-        routing.prepare().unwrap();
         let destination = "203.0.113.1:443".parse().unwrap();
         for (name, expected) in [
             (Some("allowed.example.com"), (Action::Direct, Some(0))),
@@ -231,12 +249,7 @@ mod tests {
             "[[rules]]\naction = 'direct'\nports = [0]",
             "[[rules]]\naction = 'direct'\ndomain = ['*.example.com']",
         ] {
-            assert!(
-                toml::from_str::<Routing>(source)
-                    .unwrap()
-                    .prepare()
-                    .is_err()
-            );
+            assert!(toml::from_str::<Routing>(source).is_err());
         }
         assert!(
             toml::from_str::<Routing>("[[rules]]\naction = 'direct'\nip_cidr = ['10.0.0.0/99']")

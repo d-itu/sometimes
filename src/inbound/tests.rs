@@ -307,7 +307,7 @@ fn config(action: Action) -> Config {
     "#,
     )
     .unwrap();
-    config.routing.default = action;
+    config.routing = crate::routing::Routing::new(action);
     config
 }
 async fn inbound(socks_protocol: bool, action: Action) -> (TcpStream, JoinHandle<()>) {

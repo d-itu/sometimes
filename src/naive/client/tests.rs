@@ -1868,7 +1868,6 @@ async fn proxy_route_replays_http_without_looping() {
         )
         .unwrap();
         config.upstream.port = address.port();
-        config.routing.prepare().unwrap();
         let mut client = Client::new(config.upstream.clone(), config.outbound_mark).unwrap();
         let mut roots = RootCertStore::empty();
         roots.add(cert).unwrap();

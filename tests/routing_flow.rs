@@ -12,7 +12,7 @@ async fn rejection_closes_without_connecting_to_destination_or_upstream() {
     timeout(Duration::from_secs(2), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let destination = listener.local_addr().unwrap();
-        let mut config: Config = toml::from_str(
+        let config: Config = toml::from_str(
             r#"
             listeners = [{ host = "127.0.0.1", port = 12345, protocol = "tproxy" }]
             outbound_mark = 21327
@@ -26,7 +26,6 @@ async fn rejection_closes_without_connecting_to_destination_or_upstream() {
         "#,
         )
         .unwrap();
-        config.routing.prepare().unwrap();
         let client = Client::new(config.upstream.clone(), config.outbound_mark).unwrap();
         let (mut app, stream) = tokio::io::duplex(1024);
         app.write_all(b"GET / HTTP/1.1\r\nHost: blocked.example\r\n\r\n")

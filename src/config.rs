@@ -126,9 +126,8 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let source = fs::read_to_string(path).context("read configuration")?;
         // TOML diagnostics can echo the credential-bearing source line.
-        let mut config: Self = toml::from_str(&source)
+        let config: Self = toml::from_str(&source)
             .map_err(|_| anyhow::anyhow!("invalid TOML configuration or unknown/missing fields"))?;
-        config.routing.prepare()?;
         config.validate()?;
         Ok(config)
     }
@@ -152,7 +151,6 @@ impl Config {
         );
         self.dns.validate()?;
         self.sniff.validate()?;
-        self.routing.clone().prepare()?;
         self.upstream.validate()?;
         ensure!(
             !self.upstream.username.contains(':'),

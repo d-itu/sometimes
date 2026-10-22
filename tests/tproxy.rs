@@ -104,7 +104,7 @@ async fn direct_route_bypasses_interception_and_replays_http() {
             let (stream, _) = listener.accept().await.unwrap();
             let destination = stream.local_addr().unwrap();
             assert_eq!(destination, target.parse::<SocketAddr>().unwrap());
-            let mut config: Config = toml::from_str(
+            let config: Config = toml::from_str(
                 r#"
                 listeners = [{ host = "127.0.0.1", port = 12345, protocol = "tproxy" }]
                 outbound_mark = 21327
@@ -120,7 +120,6 @@ async fn direct_route_bypasses_interception_and_replays_http() {
             "#,
             )
             .unwrap();
-            config.routing.prepare().unwrap();
             let client = Client::new(config.upstream.clone(), config.outbound_mark).unwrap();
             let flow = tokio::spawn(async move {
                 handle_flow(stream, destination, &config, &client)
