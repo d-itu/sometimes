@@ -23,14 +23,10 @@ impl PoolPolicy {
 pub(super) enum Assignment {
     Stream(Arc<Session>, StreamPermit),
     Connection(Slot),
-    Unavailable,
 }
 
 pub(super) enum Allocation {
     Any,
-    Available,
-    Existing,
-    Waiting,
     Retry,
 }
 
@@ -75,17 +71,81 @@ impl SessionPool {
             .context("upstream CONNECT queue full")
     }
 
+    pub(super) fn try_stream(
+        &self,
+        excluded: &[Weak<Session>],
+    ) -> Option<(Arc<Session>, StreamPermit)> {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.retain(|session| session.usable() || session.active() > 0);
+        Self::select_stream(&sessions, excluded)
+    }
+
+    fn eligible(session: &Arc<Session>, excluded: &[Weak<Session>]) -> bool {
+        !excluded
+            .iter()
+            .any(|failed| failed.as_ptr() == Arc::as_ptr(session))
+    }
+
+    fn select_stream(
+        sessions: &[Arc<Session>],
+        excluded: &[Weak<Session>],
+    ) -> Option<(Arc<Session>, StreamPermit)> {
+        sessions
+            .iter()
+            .filter(|session| Self::eligible(session, excluded))
+            .find_map(|session| {
+                session
+                    .try_acquire()
+                    .map(|permit| (session.clone(), permit))
+            })
+    }
+
+    pub(super) async fn wait_stream(
+        &self,
+        excluded: &[Weak<Session>],
+    ) -> (Arc<Session>, StreamPermit) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(stream) = self.try_stream(excluded) {
+                return stream;
+            }
+            notified.await;
+        }
+    }
+
+    pub(super) async fn wait_existing(
+        &self,
+        excluded: &[Weak<Session>],
+    ) -> Option<(Arc<Session>, StreamPermit)> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut sessions = self.sessions.lock().unwrap();
+                sessions.retain(|session| session.usable() || session.active() > 0);
+                if let Some(stream) = Self::select_stream(&sessions, excluded) {
+                    return Some(stream);
+                }
+                if !sessions
+                    .iter()
+                    .any(|session| session.usable() && Self::eligible(session, excluded))
+                {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
     pub(super) async fn assign(
         &self,
         allocation: Allocation,
         excluded: &[Weak<Session>],
     ) -> Assignment {
         let mut retiring: Option<Weak<Option<Slot>>> = None;
-        let eligible = |session: &Arc<Session>| {
-            !excluded
-                .iter()
-                .any(|failed| failed.as_ptr() == Arc::as_ptr(session))
-        };
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -102,25 +162,9 @@ impl SessionPool {
                     retiring = Some(Arc::downgrade(&session._slot));
                 }
                 sessions.retain(|session| session.usable() || session.active() > 0);
-                let available = sessions
-                    .iter()
-                    .filter(|session| eligible(session))
-                    .find_map(|session| {
-                        session
-                            .try_acquire()
-                            .map(|permit| (session.clone(), permit))
-                    });
-                if let Some((session, permit)) = available {
+                if let Some((session, permit)) = Self::select_stream(&sessions, excluded) {
                     drop(sessions);
                     return Assignment::Stream(session, permit);
-                }
-                if matches!(allocation, Allocation::Available)
-                    || matches!(allocation, Allocation::Existing)
-                        && !sessions
-                            .iter()
-                            .any(|session| session.usable() && eligible(session))
-                {
-                    return Assignment::Unavailable;
                 }
                 if matches!(allocation, Allocation::Retry)
                     && self.slots.available_permits() == 0
@@ -145,18 +189,14 @@ impl SessionPool {
                         self.changed.notify_waiters();
                     }
                 }
-                (!matches!(allocation, Allocation::Existing | Allocation::Waiting))
-                    .then(|| {
-                        self.slots
-                            .clone()
-                            .try_acquire_owned()
-                            .ok()
-                            .map(|permit| Slot {
-                                permit: Some(permit),
-                                changed: self.changed.clone(),
-                            })
+                self.slots
+                    .clone()
+                    .try_acquire_owned()
+                    .ok()
+                    .map(|permit| Slot {
+                        permit: Some(permit),
+                        changed: self.changed.clone(),
                     })
-                    .flatten()
             };
             if let Some(slot) = slot {
                 return Assignment::Connection(slot);

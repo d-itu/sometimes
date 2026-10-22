@@ -325,9 +325,8 @@ impl<'a> ConnectRequest<'a> {
             // Publish a completed handshake before considering another pooled session.
             biased;
             result = work => ConnectionProgress::Ready(result),
-            assignment = self.assign(Allocation::Waiting) => match assignment {
-                Assignment::Stream(session, permit) => ConnectionProgress::Reused(session, permit),
-                _ => unreachable!("waiting allocation only returns existing streams"),
+            (session, permit) = self.client.pool.wait_stream(&self.failed) => {
+                ConnectionProgress::Reused(session, permit)
             },
         }
     }
@@ -353,13 +352,11 @@ impl<'a> ConnectRequest<'a> {
     }
 
     async fn stream(&self) -> Result<(Arc<Session>, StreamPermit)> {
-        match self.assign(Allocation::Existing).await {
-            Assignment::Stream(session, permit) => Ok((session, permit)),
-            Assignment::Unavailable => Err(UnsentConnect.into()),
-            Assignment::Connection(_) => {
-                unreachable!("existing allocation cannot create connections")
-            }
-        }
+        self.client
+            .pool
+            .wait_existing(&self.failed)
+            .await
+            .ok_or_else(|| UnsentConnect.into())
     }
 
     async fn run(mut self) -> Result<Tunnel> {
@@ -379,14 +376,9 @@ impl<'a> ConnectRequest<'a> {
                         }
                         ConnectionProgress::Ready(Err(error)) => {
                             drop(slot);
-                            match self.assign(Allocation::Available).await {
-                                Assignment::Stream(session, permit) => (session, permit),
-                                Assignment::Unavailable => {
-                                    return Err(error).context("resolve upstream hostname");
-                                }
-                                Assignment::Connection(_) => {
-                                    unreachable!("available allocation cannot create connections")
-                                }
+                            match self.client.pool.try_stream(&self.failed) {
+                                Some(stream) => stream,
+                                None => return Err(error).context("resolve upstream hostname"),
                             }
                         }
                         ConnectionProgress::Reused(session, permit) => {
@@ -395,7 +387,6 @@ impl<'a> ConnectRequest<'a> {
                         }
                     }
                 }
-                Assignment::Unavailable => unreachable!("pool allocation can create connections"),
             };
             if let Ok(tunnel) = self.send(session, permit).await {
                 return Ok(tunnel);
@@ -439,7 +430,6 @@ impl<'a> ConnectRequest<'a> {
                     let establishing = self.client.establish(address, &mut slot);
                     self.while_connecting(establishing).await
                 }
-                Assignment::Unavailable => unreachable!("retry allocation can create connections"),
             };
             let (session, permit) = match progress {
                 ConnectionProgress::Reused(session, permit) => {
