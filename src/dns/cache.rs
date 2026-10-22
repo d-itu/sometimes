@@ -33,7 +33,7 @@ impl ResponseCache {
             .0
             .lock()
             .unwrap()
-            .get(&request[2..])
+            .get(request.get(2..)?)
             .filter(|entry| entry.expires > now)
             .cloned()?;
         let mut response = with_id(&entry.packet, request);

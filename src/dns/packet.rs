@@ -70,18 +70,18 @@ pub(super) fn answer_ips(packet: &[u8]) -> Vec<IpAddr> {
         }
         pos += len;
     }
-    let mut chain = vec![expected];
+    let mut chain = vec![expected.as_str()];
     while let Some((_, target)) = aliases
         .iter()
-        .find(|(owner, _)| owner == chain.last().unwrap())
+        .find(|(owner, _)| owner.as_str() == *chain.last().unwrap())
     {
-        if chain.contains(target) {
+        if chain.contains(&target.as_str()) {
             break;
         }
-        chain.push(target.clone());
+        chain.push(target.as_str());
     }
     for (owner, ip) in addresses {
-        if chain.contains(&owner) {
+        if chain.contains(&owner.as_str()) {
             out.push(ip);
         }
     }
@@ -253,6 +253,16 @@ fn header_counts(packet: &[u8]) -> Option<(usize, usize, usize, usize)> {
 }
 
 pub(super) fn cache_ttls(packet: &[u8]) -> Option<(u32, Vec<usize>)> {
+    let mut offsets = Vec::new();
+    let ttl = visit_ttls(packet, |offset| offsets.push(offset))?;
+    Some((ttl, offsets))
+}
+
+pub(super) fn min_ttl(packet: &[u8]) -> Option<u32> {
+    visit_ttls(packet, |_| {})
+}
+
+fn visit_ttls(packet: &[u8], mut visit: impl FnMut(usize)) -> Option<u32> {
     if packet.get(2)? & 0x02 != 0 || packet.get(3)? & 0x0f != 0 {
         return None;
     }
@@ -264,8 +274,7 @@ pub(super) fn cache_ttls(packet: &[u8]) -> Option<(u32, Vec<usize>)> {
     if pos > packet.len() {
         return None;
     }
-    let mut min_ttl = u32::MAX;
-    let mut ttl_offsets = Vec::new();
+    let mut min_ttl = None;
     for _ in 0..an + ns + ar {
         pos = skip_name(packet, pos)?;
         let fields = packet.get(pos..pos.checked_add(10)?)?;
@@ -278,12 +287,12 @@ pub(super) fn cache_ttls(packet: &[u8]) -> Option<(u32, Vec<usize>)> {
         }
         // OPT's TTL slot carries extended RCODE and flags, not a lifetime.
         if record_type != 41 {
-            min_ttl = min_ttl.min(ttl);
-            ttl_offsets.push(pos + 4);
+            min_ttl = Some(min_ttl.map_or(ttl, |previous: u32| previous.min(ttl)));
+            visit(pos + 4);
         }
         pos = end;
     }
-    (min_ttl > 0 && !ttl_offsets.is_empty()).then_some((min_ttl, ttl_offsets))
+    min_ttl.filter(|&ttl| ttl > 0)
 }
 
 pub(super) fn with_id(packet: &[u8], request: &[u8]) -> Result<Vec<u8>> {

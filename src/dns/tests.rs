@@ -40,6 +40,16 @@ fn direct_context_with_config(config: Config) -> Context {
 }
 
 #[tokio::test]
+async fn rejects_truncated_queries_before_upstream_lookup() {
+    let context = direct_context(Upstream::default());
+    let request = packet::make_query("example.com", 1);
+    for len in 0..request.len() {
+        let error = context.handle(&request[..len]).await.unwrap_err();
+        assert_eq!(error.to_string(), "invalid DNS query", "query length {len}");
+    }
+}
+
+#[tokio::test]
 async fn udp_truncation_preserves_full_tcp_and_cached_replies() {
     timeout(Duration::from_secs(5), async {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();

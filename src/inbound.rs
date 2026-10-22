@@ -17,7 +17,7 @@ use crate::{
     },
     outbound::connect_outbound,
     relay::{IdleIo, relay},
-    routing::{Action, normalize_domain},
+    routing::{Action, normalized_host},
 };
 use anyhow::Result;
 use rama::{
@@ -113,7 +113,7 @@ pub(crate) fn tunnel_transport(tunnel: Tunnel, idle: Duration) -> Transport {
 }
 impl State {
     async fn connect(&self, host: &str, port: u16) -> io::Result<Egress> {
-        let domain = normalize_domain(host);
+        let domain = normalized_host(host);
         if domain.is_none() && host.parse::<IpAddr>().is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -121,7 +121,8 @@ impl State {
             ));
         }
         let before_dns = domain
-            .as_deref()
+            .as_ref()
+            .map(Domain::as_str)
             .and_then(|name| self.config.routing.select_before_dns(name, port));
         if before_dns == Some(Action::Reject) {
             return Err(io::Error::new(
@@ -139,11 +140,8 @@ impl State {
             Duration::from_secs(self.config.connect_timeout_secs),
             async {
                 if before_dns == Some(Action::Proxy) {
-                    let name = domain.as_deref().expect("pre-DNS decision has a domain");
                     let destination = HostWithPort::new(
-                        Domain::try_from(name)
-                            .expect("normalized domain is valid")
-                            .into(),
+                        domain.expect("pre-DNS decision has a domain").into(),
                         port,
                     );
                     tracing::info!(%destination, ?before_dns, "route selected");
@@ -164,12 +162,16 @@ impl State {
                 }
                 let transport = match host.parse() {
                     Ok(ip) => {
-                        self.connect_resolved([SocketAddr::new(ip, port)], domain.as_deref())
-                            .await?
+                        self.connect_resolved(
+                            [SocketAddr::new(ip, port)],
+                            domain.as_ref().map(Domain::as_str),
+                        )
+                        .await?
                     }
                     Err(_) => {
                         let addresses = tokio::net::lookup_host((host, port)).await?;
-                        self.connect_resolved(addresses, domain.as_deref()).await?
+                        self.connect_resolved(addresses, domain.as_ref().map(Domain::as_str))
+                            .await?
                     }
                 };
                 Ok(Egress {
@@ -275,13 +277,13 @@ fn spawn(tasks: &Tasks, task: impl Future<Output = ()> + Send + 'static) -> Abor
 }
 async fn request(mut request: Request<Incoming>, state: State, tasks: Tasks) -> Response {
     let connect = request.method() == Method::CONNECT;
-    let Some(authority) = request.uri().authority().map(|a| a.to_string()) else {
+    let Some(authority) = request.uri().authority() else {
         return response(StatusCode::BAD_REQUEST);
     };
     let port = request.uri().port_u16();
     if (!connect && request.uri().scheme_str() != Some("http"))
         || (connect && port.is_none())
-        || authority.contains('@')
+        || authority.userinfo().is_some()
     {
         return response(StatusCode::BAD_REQUEST);
     }
@@ -317,6 +319,7 @@ async fn request(mut request: Request<Incoming>, state: State, tasks: Tasks) -> 
         });
         return response(StatusCode::OK);
     }
+    let authority = authority.to_string().parse().unwrap();
     request
         .uri_mut()
         .unset_scheme()
@@ -324,9 +327,7 @@ async fn request(mut request: Request<Incoming>, state: State, tasks: Tasks) -> 
         .ensure_path_or_root();
     *request.version_mut() = Version::HTTP_11;
     strip_hop_headers(request.headers_mut());
-    request
-        .headers_mut()
-        .insert(header::HOST, authority.as_str().parse().unwrap());
+    request.headers_mut().insert(header::HOST, authority);
     // The response body owns the origin driver's lifetime; ingress can be reused.
     let (mut sender, connection) = match http1::handshake(upstream).await {
         Ok(value) => value,

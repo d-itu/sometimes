@@ -152,7 +152,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PaddingIo<T> {
         }
         let len = buf.len().min(CHUNK);
         let padding = rand::random::<u8>();
-        write.buffer.reserve(CHUNK + 3 + 255);
+        write.buffer.reserve(len + 3 + usize::from(padding));
         write.buffer.extend_from_slice(&(len as u16).to_be_bytes());
         write.buffer.push(padding);
         write.buffer.extend_from_slice(&buf[..len]);

@@ -36,6 +36,16 @@ pub struct Rule {
 }
 
 pub fn normalize_domain(value: &str) -> Option<String> {
+    let name = normalized_name(value)?;
+    Domain::try_from(name.as_str()).ok()?;
+    Some(name)
+}
+
+pub(crate) fn normalized_host(value: &str) -> Option<Domain> {
+    Domain::try_from(normalized_name(value)?).ok()
+}
+
+fn normalized_name(value: &str) -> Option<String> {
     let name = value
         .strip_suffix('.')
         .unwrap_or(value)
@@ -43,7 +53,6 @@ pub fn normalize_domain(value: &str) -> Option<String> {
     if name.contains('*') || name.parse::<IpAddr>().is_ok() {
         return None;
     }
-    Domain::try_from(name.as_str()).ok()?;
     Some(name)
 }
 

@@ -10,7 +10,7 @@ use anyhow::{Result, ensure};
 use lru::LruCache;
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::packet::{answer_ips, cache_ttls, make_query};
+use super::packet::{answer_ips, make_query, min_ttl};
 use super::{Config, upstream::query_udp};
 
 pub(super) type BootstrapCache =
@@ -121,7 +121,7 @@ impl Resolver {
                             .min(Duration::from_millis(50));
                         deadline = now + grace;
                     }
-                    let ttl = cache_ttls(&response).map_or(0, |(seconds, _)| seconds);
+                    let ttl = min_ttl(&response).unwrap_or(0);
                     let deadline = received_at + Duration::from_secs(ttl.into());
                     expires =
                         Some(expires.map_or(deadline, |previous: Instant| previous.min(deadline)));

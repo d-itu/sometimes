@@ -398,10 +398,10 @@ impl Context {
     }
 
     async fn handle(&self, request: &[u8]) -> Result<Vec<u8>> {
-        let (name, _, _) = query(request).ok_or_else(|| anyhow::anyhow!("invalid DNS query"))?;
         if let Some(response) = self.cache.get(request) {
             return response;
         }
+        let (name, _, _) = query(request).ok_or_else(|| anyhow::anyhow!("invalid DNS query"))?;
         let Some(index) = self.dns_routing.target(&name) else {
             return error_response(request, 5);
         };
