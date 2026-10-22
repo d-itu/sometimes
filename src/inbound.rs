@@ -29,7 +29,7 @@ use rama::{
         header,
         io::upgrade::handle_upgrade,
     },
-    io::BridgeIo,
+    io::{BridgeIo, HeapReader, PrefixedIo},
     net::{
         address::{Domain, HostWithPort},
         client::{ConnectRequest, EstablishedClientConnection},
@@ -40,7 +40,7 @@ use rama::{
     tcp::TcpStream as RamaTcpStream,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
     net::TcpStream,
     sync::{Notify, OwnedSemaphorePermit, Semaphore},
     task::{AbortHandle, JoinSet},
@@ -356,11 +356,30 @@ async fn request(mut request: Request<Incoming>, state: State, tasks: Tasks) -> 
 }
 
 pub async fn http(
-    stream: TcpStream,
+    mut stream: TcpStream,
     config: Arc<Config>,
     client: Arc<Client>,
     permits: Arc<Semaphore>,
 ) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.connect_timeout_secs);
+    // Rama's version detector cannot resume a partially read H2 preface safely.
+    let mut prefix = vec![0; 24];
+    let mut filled = 0;
+    tokio::time::timeout_at(deadline, async {
+        while filled < prefix.len() {
+            let size = stream.read(&mut prefix[filled..]).await?;
+            filled += size;
+            if size == 0 || !b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(&prefix[..filled]) {
+                break;
+            }
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await??;
+    prefix.truncate(filled);
+    let stream = PrefixedIo::new(HeapReader::from(prefix), RamaTcpStream::new(stream));
+    let negotiated = Arc::new(Notify::new());
+    let ready = negotiated.clone();
     let state = State {
         config,
         client,
@@ -369,15 +388,26 @@ pub async fn http(
     let tasks = Tasks::default();
     let pending = tasks.clone();
     let service = service_fn(move |req| {
+        ready.notify_one();
         let state = state.clone();
         let tasks = pending.clone();
         async move { Ok::<_, Infallible>(request(req, state, tasks).await) }
     });
     let mut builder = auto::Builder::new(Executor::default());
     builder.h2_mut().set_max_concurrent_streams(32);
-    let result = builder
-        .serve_connection_with_upgrades(RamaTcpStream::new(stream), service)
-        .await;
+    let serving = builder.serve_connection_with_upgrades(stream, service);
+    tokio::pin!(serving);
+    let completed = tokio::time::timeout_at(deadline, async {
+        tokio::select! {
+            result = &mut serving => Some(result),
+            _ = negotiated.notified() => None,
+        }
+    })
+    .await?;
+    let result = match completed {
+        Some(result) => result,
+        None => serving.await,
+    };
     let mut pending = {
         let mut tasks = tasks.lock().unwrap();
         mem::take(&mut *tasks)
