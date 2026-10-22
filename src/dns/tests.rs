@@ -174,6 +174,29 @@ fn rejects_invalid_dns_upstream_references() {
     assert!(config.validate().is_err());
 }
 
+#[test]
+fn rejects_zero_dns_listener_and_bootstrap_ports() {
+    let mut config = Config {
+        enabled: true,
+        listen: vec!["127.0.0.1:1053".parse().unwrap()],
+        ..Config::default()
+    };
+    config.validate().unwrap();
+
+    config.listen.push("127.0.0.1:0".parse().unwrap());
+    assert_eq!(
+        config.validate().unwrap_err().to_string(),
+        "dns.listen ports must be nonzero"
+    );
+    config.listen.pop();
+
+    config.bootstrap.push("127.0.0.1:0".parse().unwrap());
+    assert_eq!(
+        config.validate().unwrap_err().to_string(),
+        "dns.bootstrap ports must be nonzero"
+    );
+}
+
 #[tokio::test]
 async fn valid_bootstrap_address_survives_unresponsive_queries() {
     timeout(Duration::from_secs(3), async {

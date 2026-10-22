@@ -155,6 +155,14 @@ impl Config {
                 "dns.bootstrap is required when DNS is enabled"
             );
         }
+        ensure!(
+            self.listen.iter().all(|address| address.port() != 0),
+            "dns.listen ports must be nonzero"
+        );
+        ensure!(
+            self.bootstrap.iter().all(|address| address.port() != 0),
+            "dns.bootstrap ports must be nonzero"
+        );
         let mut names = HashSet::new();
         for upstream in &self.upstreams {
             ensure!(
