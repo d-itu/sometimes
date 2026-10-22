@@ -11,7 +11,7 @@ use tokio::{
 use super::{
     Config, Protocol, Upstream,
     bootstrap::{Resolver, Target},
-    packet::validate_response,
+    packet::{error_response, validate_response},
 };
 use crate::{
     naive::{client::Client, padding::PaddingIo},
@@ -86,16 +86,20 @@ impl QueryClient {
     async fn query_inner(&self, request: &[u8], prepared: &PreparedUpstream) -> Result<Vec<u8>> {
         let upstream = &prepared.config;
         let domain = prepared.target.domain();
-        if let Some(name) = domain
-            && self.routing.select_before_dns(name, upstream.port) == Some(Action::Proxy)
-        {
-            ensure!(
-                upstream.protocol != Protocol::Udp,
-                "UDP DNS cannot use NaiveProxy"
-            );
-            let target = prepared.proxy_target.as_ref().unwrap().clone();
-            tracing::info!(upstream = %upstream.name, %target, "DNS upstream routed through proxy");
-            return self.query_tcp_proxy(request, target).await;
+        if let Some(name) = domain {
+            match self.routing.select_before_dns(name, upstream.port) {
+                Some(Action::Reject) => return error_response(request, 5),
+                Some(Action::Proxy) => {
+                    ensure!(
+                        upstream.protocol != Protocol::Udp,
+                        "UDP DNS cannot use NaiveProxy"
+                    );
+                    let target = prepared.proxy_target.as_ref().unwrap().clone();
+                    tracing::info!(upstream = %upstream.name, %target, "DNS upstream routed through proxy");
+                    return self.query_tcp_proxy(request, target).await;
+                }
+                _ => {}
+            }
         }
         let addresses = self.resolver.resolve_host(&prepared.target).await?;
         let mut last_error = None;
@@ -112,7 +116,7 @@ impl QueryClient {
                 "DNS upstream route selected"
             );
             let result = match action {
-                Action::Reject => Err(anyhow::anyhow!("DNS upstream rejected by routing")),
+                Action::Reject => return error_response(request, 5),
                 Action::Direct => match upstream.protocol {
                     Protocol::Udp => {
                         query_udp(request, address, self.max_packet_bytes, self.mark).await
